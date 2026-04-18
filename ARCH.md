@@ -2,174 +2,149 @@
 
 ## Overview
 
-`rpc-bench` measures the performance of a remote key-value service implemented
-with Cap'n Proto RPC. The observable system consists of:
+`rpc-bench` measures one simple remote service: framed TCP requests whose
+responses are the CRC32 hash of the request payload. The observable system
+consists of:
 
-- A key-value RPC interface with `Get`, `Put`, and `Delete`.
-- A server executable that exposes exactly one shard on exactly one endpoint.
-- A benchmark executable that can either connect to one existing endpoint or
-  spawn one local server process.
-- A reporting layer that emits human-readable summaries and machine-readable
-  JSON for each benchmark run.
+- an internal `protocol` library shared by both frontends
+- `rpc-bench-server`, a single-endpoint hash server
+- `rpc-bench-bench`, a benchmark driver that runs against one endpoint
 
-The project is intentionally structured so the benchmark logic, reporting, and
-configuration parsing are reusable without committing to a persistent storage
-engine yet.
+The implementation is intentionally small and explicit. This version does not
+define persistence, sharding, multi-endpoint runs, or a multi-threaded server.
 
-## Behavioral Model
+## Wire Semantics
 
-### Key-value semantics
+### Request frame
 
-- Keys and values are opaque byte strings.
-- `Put` stores or replaces the value for a key.
-- `Get` returns `found=false` with an empty value when the key is absent.
-- `Get` returns `found=true` and the stored bytes when the key is present.
-- `Delete` removes the key if it exists and reports whether removal happened.
+- Each request begins with a 4-byte unsigned big-endian payload length.
+- The length is followed immediately by that many payload bytes.
+- A zero-length payload is valid.
+- The maximum permitted payload length is 1 MiB.
 
-The v1 implementation uses an in-memory map. Restarting a server discards all
-data. Persistence and crash recovery are explicitly out of scope for this
-revision.
+### Response frame
 
-### Endpoint and thread model
+- Each successful response is one 4-byte unsigned big-endian CRC32 value.
+- The CRC32 uses the standard IEEE polynomial and is computed over the request
+  payload bytes only.
 
-Each server process owns a single event loop, a single Cap'n Proto listener,
-and a single in-memory shard. Each benchmark run targets exactly one endpoint.
+### Invalid input handling
 
-This choice preserves three properties that matter for reproducible benchmarks:
+- If a client advertises a payload length above 1 MiB, the server closes the
+  connection.
+- If a connection breaks during a frame read or write, the server drops that
+  connection without affecting other clients.
 
-- One Cap'n Proto EzRpc event loop is owned by one thread.
-- The benchmark never hides sharding behind a multi-endpoint run.
-- Remote and spawn-local runs share the same single-endpoint execution shape.
+## Server Semantics
 
-All client threads talk to the same endpoint for the lifetime of a run. Every
-thread still owns a distinct logical key-space, so `Get` and `Delete`
-operations observe real key-value semantics without requiring cross-thread
-client sharing.
+### Runtime model
 
-The current server implementation is single-threaded and async. In spawn-local
-mode the benchmark can request `server_threads`, but the server warns and falls
-back to one effective server thread when a value greater than `1` is supplied.
-Connect mode does not allow the benchmark to configure remote server thread
-counts.
+- One process owns one `asio::io_context`.
+- One process listens on one TCP endpoint.
+- The server is single-threaded and async in this milestone.
+- Each accepted connection is handled by its own coroutine.
+- Each connection is strictly request/response serial: the next request is not
+  read until the current reply has been written.
 
-## RPC Contract
+### Lifecycle
 
-The wire protocol is defined in `schemas/kv.capnp`.
+- The server starts listening before entering the main event loop.
+- Unless `--quiet` is set, it prints one startup banner with the bound
+  endpoint.
+- `SIGINT` and `SIGTERM` trigger graceful shutdown by stopping accepts and
+  letting the process exit the event loop.
 
-- `Get(key)` returns `found` and `value`.
-- `Put(key, value)` stores bytes and returns no payload.
-- `Delete(key)` returns `found`.
+## Benchmark Semantics
 
-The benchmark relies on this interface being stable. Any future reimplementation
-in another language must preserve request and response semantics exactly if it
-claims wire compatibility with this version.
+### Run modes
 
-## Benchmark Model
+- `connect` benchmarks one already running endpoint.
+- `spawn-local` starts one local child `rpc-bench-server`, waits for the
+  endpoint to become reachable, runs the workload, and then stops the child.
 
-### Load generation
+Every benchmark invocation targets exactly one endpoint.
 
-The benchmark uses a bounded in-flight model:
+### Client concurrency model
 
-- Each client thread owns one EzRpc client and one event loop.
-- Each client thread maintains up to `queue_depth` outstanding RPC chains.
-- As soon as one request completes, the same chain issues the next request
-  until the phase deadline is reached.
+- `client_threads` is one OS thread per connection.
+- Each thread owns one TCP socket for the entire run.
+- Each thread keeps exactly one request outstanding at a time.
 
-This is a closed-loop workload. Throughput therefore reflects service time,
-network time, queue depth, and client backpressure together.
+This is a closed-loop benchmark. A client thread sends the next request only
+after the previous response arrives.
 
 ### Workload contents
 
-The workload is defined by:
+- Request payload sizes are sampled uniformly from an inclusive size range.
+- The default range is `128-256` bytes.
+- Payload contents are generated from a deterministic PRNG stream derived from
+  the configured seed and thread index.
+- Each invocation has one warmup phase and one measured phase.
+- Warmup traffic is not included in the reported statistics.
 
-- Client thread-count sweep.
-- Queue-depth sweep.
-- Key-size sweep.
-- Value-size sweep.
-- One or more operation mixes expressed as `get:put:delete` percentages.
-- Warmup duration.
-- Measured duration.
-- Iteration count.
-- Seed and key-space size.
+## Reporting Semantics
 
-Spawn-local mode also accepts one requested server-thread count. That setting
-is not a sweep in this version, and the current implementation always executes
-with one effective server thread after any required fallback.
+### Counted traffic
 
-Each iteration begins with a prefill stage that inserts the thread-local
-key-space for every participating client thread. Prefill is not counted toward
-reported throughput or latency.
+- `requestBytes` counts wire bytes sent during the measured phase:
+  4-byte length prefixes plus payload bytes.
+- `responseBytes` counts wire bytes received during the measured phase:
+  one 4-byte CRC32 reply per successful request.
 
-### Reporting
+### Latency
 
-For every matrix point and iteration the benchmark reports:
+- Latency is round-trip time from the start of the request send until the full
+  4-byte response has been received.
+- Reported percentiles are `p50`, `p75`, `p90`, `p99`, and `p99.9`.
+- Percentiles are computed from successful measured requests only.
 
-- Effective server thread count.
-- Endpoint used for the run.
-- Total operation count.
-- Per-operation counts for get, put, and delete.
-- Found and missing get counts.
-- Removed and missing delete counts.
-- Error count.
-- Request and response payload bytes.
-- Operations per second.
-- MiB per second.
-- Latency min, p50, p90, p99, and max.
+### Throughput
 
-The text report is intended for terminals and quick inspection. The JSON report
-is intended for automation and later comparison tooling.
+- Request throughput is `requestBytes / measuredSeconds`.
+- Response throughput is `responseBytes / measuredSeconds`.
+- Combined throughput is `(requestBytes + responseBytes) / measuredSeconds`.
+- Request-rate throughput is `totalRequests / measuredSeconds`.
+
+The benchmark emits both a terminal summary and an optional JSON document with
+the same core fields.
 
 ## Implementation Structure
 
-The codebase is split into an internal core library plus runnable frontends:
+- `src/protocol/`: internal parsing helpers, size-range validation, framing
+  helpers, and CRC32 implementation
+- `src/server/`: CLI parsing, async listener setup, per-connection coroutines,
+  and process lifecycle
+- `src/bench/`: CLI parsing, child-process management for `spawn-local`,
+  workload generation, metric aggregation, and report rendering
 
-- `config`: CLI parsing, validation, and usage text.
-- `storage`: key-value abstractions and the in-memory backend.
-- `rpc`: Cap'n Proto service implementation and server runner.
-- `metrics`: benchmark result types plus text and JSON formatting.
-- `bench`: workload execution, local process spawning, remote connection logic,
-  and metric aggregation.
-
-The core library is internal-only in this version. Headers live under
-`include/rpcbench/` for code organization, but the project does not install a
-public SDK or guarantee downstream source compatibility yet.
+The protocol layer is internal-only. This repository does not expose or install
+a public SDK surface in this version.
 
 ## Design Decisions And Trade-offs
 
-### Why EzRpc first
+### Why raw framed TCP
 
-EzRpc gives a correct and compact Cap'n Proto server/client integration point
-for the first benchmarkable version. The trade-off is that transport control is
-less flexible than lower-level two-party RPC APIs.
+The benchmark is focused on transport and request/response timing for a tiny
+hashing service. Raw framed TCP keeps the wire contract small and auditable and
+avoids hiding benchmark costs behind a richer RPC stack.
 
-### Why explicit Meson source lists
+### Why standalone Asio
 
-Meson does not treat wildcard source discovery as a primary model. Explicit
-source lists keep the build graph reviewable and make generated-code edges
-obvious.
+Standalone Asio provides a compact async runtime that works well with C++23
+coroutines and fits the single-threaded event-loop design without introducing a
+larger framework surface.
 
-### Why single-endpoint runs for now
+### Why one outstanding request per connection
 
-Single-endpoint runs keep ownership boundaries simple:
+One in-flight request per connection keeps RTT semantics unambiguous and
+matches the user-requested client model. The trade-off is that this version
+does not explore pipelining or open-loop traffic generation.
 
-- One process owns one event loop.
-- The benchmark result shape stays aligned with what actually executed.
-- Remote deployment stays a first-class path without hidden sharding behavior.
+## Non-goals For This Milestone
 
-The trade-off is that the benchmark does not yet model multi-endpoint or
-multi-threaded server execution. The `server_threads` flag exists to reserve
-the future interface, but values above `1` currently warn and fall back to the
-single-threaded async server.
-
-## Future Work
-
-The architecture intentionally leaves room for:
-
-- Persistent storage engines.
-- Richer workload policies and open-loop traffic generation.
-- Cross-host orchestration helpers.
-- A real multi-threaded server implementation behind `server_threads`.
-- Additional RPC methods, such as batched operations or range scans.
-
-Any future change that alters wire semantics, sharding semantics, report
-semantics, or lifecycle expectations must update this file.
+- multi-threaded server execution
+- multiple endpoints in one benchmark invocation
+- persistence or recovery semantics
+- compatibility with the deleted Cap'n Proto key-value benchmark
+- automated tests, coverage tracking, or benchmark sweeps beyond one run per
+  invocation
