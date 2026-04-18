@@ -1,0 +1,3 @@
+# Vendored dependencies and generated build trees should keep their own style.
+subprojects/**
+builddir-*/**

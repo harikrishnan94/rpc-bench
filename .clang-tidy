@@ -1,0 +1,33 @@
+# Keep the default set focused on correctness, concurrency, and maintainability.
+Checks:
+  - '-*'
+  - 'clang-analyzer-*'
+  - 'bugprone-*'
+  - 'concurrency-*'
+  - 'performance-*'
+  - 'misc-const-correctness'
+  - 'misc-definitions-in-headers'
+  - 'modernize-use-nullptr'
+  - 'modernize-use-override'
+  - 'readability-avoid-const-params-in-decls'
+  - 'readability-make-member-function-const'
+  - 'readability-misleading-indentation'
+  - 'readability-redundant-control-flow'
+  - 'readability-redundant-member-init'
+  - 'readability-simplify-boolean-expr'
+  - 'cppcoreguidelines-avoid-non-const-global-variables'
+  - 'cppcoreguidelines-init-variables'
+  - 'cppcoreguidelines-slicing'
+  - 'cppcoreguidelines-special-member-functions'
+  - 'cppcoreguidelines-virtual-class-destructor'
+
+HeaderFilterRegex: '(^|.*[\\/])(include|src)[\\/]'
+ExcludeHeaderFilterRegex: '(^|.*[\\/])(subprojects|builddir-[^\\/]+)[\\/]'
+HeaderFileExtensions: ['', 'h', 'hh', 'hpp', 'hxx', 'inc', 'inl', 'ixx', 'mpp', 'cppm']
+ImplementationFileExtensions: ['c', 'cc', 'cpp', 'cxx']
+FormatStyle: file
+SystemHeaders: false
+
+CheckOptions:
+  - key: concurrency-mt-unsafe.FunctionSet
+    value: any

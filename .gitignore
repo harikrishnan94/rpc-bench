@@ -1,0 +1,22 @@
+.DS_Store
+
+# Meson/Ninja build outputs
+builddir/
+builddir-coverage/
+out/
+compile_commands.json
+native/*.ini
+subprojects/*
+!subprojects/*.wrap
+
+# IDE/editor noise
+.vscode/
+.cache/
+.idea/
+*.swp
+*.swo
+
+# Local tools configuration
+.local-tools.yml
+
+*.profraw

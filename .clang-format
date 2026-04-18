@@ -1,0 +1,28 @@
+# Storage-engine code benefits from predictable layout more than dense packing.
+BasedOnStyle: LLVM
+IndentWidth: 2
+ContinuationIndentWidth: 4
+TabWidth: 2
+UseTab: Never
+ColumnLimit: 100
+
+AccessModifierOffset: -2
+NamespaceIndentation: None
+BreakBeforeBraces: Attach
+SpaceBeforeParens: ControlStatements
+
+PointerAlignment: Left
+DerivePointerAlignment: false
+AlignAfterOpenBracket: Align
+BinPackArguments: false
+BinPackParameters: false
+
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+IncludeBlocks: Regroup
+SortIncludes: true
+ReflowComments: false
