@@ -12,9 +12,9 @@
 namespace rpcbench {
 
 class EzRpcServerRunner {
-  // Runs one Cap'n Proto server endpoint backed by one `KvStore`. Multi-worker
-  // sweeps are represented as multiple processes and endpoints rather than a
-  // thread pool inside one server process.
+  // Runs one Cap'n Proto server endpoint backed by one `KvStore`. The current
+  // implementation owns one async event loop; higher requested thread counts
+  // warn and fall back to this single-threaded server shape.
 public:
   EzRpcServerRunner(ServerConfig config, std::shared_ptr<KvStore> store);
 

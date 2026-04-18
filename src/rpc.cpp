@@ -1,6 +1,6 @@
 // Cap'n Proto service implementation and the blocking EzRpc server lifecycle.
-// The server intentionally owns one shard per process so benchmark worker
-// counts map cleanly onto one event loop and one endpoint each.
+// The server intentionally owns one shard, one async event loop, and one
+// endpoint per process.
 
 #include "rpcbench/rpc.hpp"
 
@@ -8,6 +8,7 @@
 
 #include <capnp/ez-rpc.h>
 #include <csignal>
+#include <cstdio>
 #include <format>
 #include <kj/async-io.h>
 #include <kj/async.h>
@@ -92,6 +93,12 @@ void EzRpcServerRunner::run() const {
   g_shutdown_requested = 0;
   const auto previous_sigterm = std::signal(SIGTERM, request_shutdown);
   const auto previous_sigint = std::signal(SIGINT, request_shutdown);
+
+  if (config_.server_threads > 1) {
+    std::println(stderr,
+                 "warning: multi-threaded server is not yet implemented; defaulting to "
+                 "single-threaded async server");
+  }
 
   auto service = kj::heap<KvServiceImpl>(*store_);
   capnp::EzRpcServer server(kj::mv(service), config_.listen_host, config_.port);

@@ -4,7 +4,6 @@
 
 #include "rpcbench/metrics.hpp"
 
-#include <algorithm>
 #include <format>
 #include <string_view>
 
@@ -32,17 +31,6 @@ std::string format_latency(std::uint64_t nanoseconds) {
     return std::format("{:.2f}us", static_cast<double>(nanoseconds) / 1'000.0);
   }
   return std::format("{}ns", nanoseconds);
-}
-
-std::string join_strings(const std::vector<std::string>& values, std::string_view delimiter) {
-  std::string joined;
-  for (std::size_t index = 0; index < values.size(); ++index) {
-    if (index != 0) {
-      joined += delimiter;
-    }
-    joined += values[index];
-  }
-  return joined;
 }
 
 std::string json_escape(std::string_view text) {
@@ -76,22 +64,23 @@ std::string json_escape(std::string_view text) {
 }
 
 std::string format_result_text(const BenchmarkResult& result, std::size_t index) {
-  return std::format("Run {}: workers={} clients={} queue={} key={} value={} mix={} iteration={}\n"
-                     "  Endpoints: {}\n"
+  return std::format("Run {}: serverThreads={} clients={} queue={} key={} value={} mix={} "
+                     "iteration={}\n"
+                     "  Endpoint: {}\n"
                      "  Throughput: {:.2f} ops/s, {:.2f} MiB/s\n"
                      "  Latency: min={} p50={} p90={} p99={} max={}\n"
                      "  Ops: total={} get={} put={} delete={} errors={}\n"
                      "  Outcomes: found-get={} missing-get={} removed-delete={} missing-delete={}\n"
                      "  Bytes: request={} response={}\n",
                      index + 1,
-                     result.server_workers,
+                     result.server_threads,
                      result.client_threads,
                      result.queue_depth,
                      result.key_size,
                      result.value_size,
                      result.mix.label(),
                      result.iteration,
-                     join_strings(result.endpoints, ", "),
+                     result.endpoint,
                      result.ops_per_second,
                      result.mib_per_second,
                      format_latency(result.latency.min_ns),
@@ -148,7 +137,7 @@ std::string BenchmarkReport::to_json() const {
   for (std::size_t index = 0; index < results.size(); ++index) {
     const auto& result = results[index];
     json += "    {\n";
-    json += std::format("      \"serverWorkers\": {},\n", result.server_workers);
+    json += std::format("      \"serverThreads\": {},\n", result.server_threads);
     json += std::format("      \"clientThreads\": {},\n", result.client_threads);
     json += std::format("      \"queueDepth\": {},\n", result.queue_depth);
     json += std::format("      \"keySize\": {},\n", result.key_size);
@@ -158,14 +147,9 @@ std::string BenchmarkReport::to_json() const {
     json += ",\n";
     json += std::format("      \"iteration\": {},\n", result.iteration);
     json += std::format("      \"measureSeconds\": {:.6f},\n", result.measure_seconds);
-    json += "      \"endpoints\": [";
-    for (std::size_t endpoint = 0; endpoint < result.endpoints.size(); ++endpoint) {
-      if (endpoint != 0) {
-        json += ", ";
-      }
-      append_json_string(json, result.endpoints[endpoint]);
-    }
-    json += "],\n";
+    json += "      \"endpoint\": ";
+    append_json_string(json, result.endpoint);
+    json += ",\n";
     json += "      \"counts\": {\n";
     json += std::format("        \"totalOps\": {},\n", result.counts.total_ops);
     json += std::format("        \"getOps\": {},\n", result.counts.get_ops);

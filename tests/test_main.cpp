@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <kj/exception.h>
 #include <print>
 #include <signal.h>
@@ -105,6 +107,14 @@ struct ChildServer {
   }
 };
 
+struct CapturedProcess {
+  // Captures a child process exit status plus both output streams so the CLI
+  // integration tests can assert warnings and rendered benchmark reports.
+  int exit_status = -1;
+  std::string stdout_text;
+  std::string stderr_text;
+};
+
 kj::ArrayPtr<const capnp::byte> as_capnp_bytes(const std::string& value) {
   const auto* data = reinterpret_cast<const capnp::byte*>(value.data());
   return kj::ArrayPtr<const capnp::byte>(data, value.size());
@@ -127,6 +137,67 @@ ChildServer spawn_server_process(const std::filesystem::path& server_path, int p
   }
 
   return ChildServer(pid);
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  require(static_cast<bool>(stream), std::format("expected '{}' to open", path.string()));
+  return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
+CapturedProcess run_process_capture(const std::filesystem::path& program,
+                                    std::initializer_list<std::string> args) {
+  // Temporary files keep stdout and stderr separate without risking pipe
+  // deadlocks when the benchmark process spawns a local child server.
+  require(std::filesystem::exists(program), "process under test should exist");
+
+  char stdout_template[] = "/tmp/rpc-bench-stdout-XXXXXX";
+  char stderr_template[] = "/tmp/rpc-bench-stderr-XXXXXX";
+  const int stdout_fd = ::mkstemp(stdout_template);
+  const int stderr_fd = ::mkstemp(stderr_template);
+  require(stdout_fd >= 0, "stdout capture file should open");
+  require(stderr_fd >= 0, "stderr capture file should open");
+
+  const auto program_string = program.string();
+  std::vector<std::string> owned_args(args);
+  const pid_t pid = ::fork();
+  require(pid >= 0, "fork should succeed");
+
+  if (pid == 0) {
+    ::dup2(stdout_fd, STDOUT_FILENO);
+    ::dup2(stderr_fd, STDERR_FILENO);
+    ::close(stdout_fd);
+    ::close(stderr_fd);
+
+    std::vector<char*> argv;
+    argv.reserve(owned_args.size() + 2);
+    argv.push_back(const_cast<char*>(program_string.c_str()));
+    for (auto& arg : owned_args) {
+      argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    ::execv(program_string.c_str(), argv.data());
+    _exit(127);
+  }
+
+  ::close(stdout_fd);
+  ::close(stderr_fd);
+
+  int status = 0;
+  require(::waitpid(pid, &status, 0) == pid, "waitpid should observe the child");
+
+  const auto stdout_path = std::filesystem::path(stdout_template);
+  const auto stderr_path = std::filesystem::path(stderr_template);
+  CapturedProcess result{
+      .exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+      .stdout_text = read_text_file(stdout_path),
+      .stderr_text = read_text_file(stderr_path),
+  };
+
+  std::filesystem::remove(stdout_path);
+  std::filesystem::remove(stderr_path);
+  return result;
 }
 
 void wait_for_server_ready(std::string_view endpoint) {
@@ -152,19 +223,22 @@ void test_server_config_parser() {
   auto config = rpcbench::parse_server_config(make_args({
       "--listen-host=0.0.0.0",
       "--port=7100",
+      "--server-threads=3",
       "--quiet",
   }));
 
   require(config.has_value(), "server config should parse");
   require(config->listen_host == "0.0.0.0", "listen host should match");
   require(config->port == 7100, "port should match");
+  require(config->server_threads == 3, "server thread count should match");
   require(config->quiet, "quiet flag should be set");
 }
 
 void test_bench_config_parser() {
   auto config = rpcbench::parse_bench_config(make_args({
                                                  "--mode=spawn-local",
-                                                 "--server-workers=1,2",
+                                                 "--server-port=7400",
+                                                 "--server-threads=4",
                                                  "--client-threads=1,4",
                                                  "--queue-depths=1,8",
                                                  "--key-sizes=8",
@@ -181,7 +255,8 @@ void test_bench_config_parser() {
 
   require(config.has_value(), "benchmark config should parse");
   require(config->mode == rpcbench::BenchMode::spawn_local, "mode should match");
-  require(config->server_workers.size() == 2, "worker sweep should parse");
+  require(config->server_port == 7400, "server port should match");
+  require(config->server_threads == 4, "server thread count should match");
   require(config->workload.client_threads.size() == 2, "client thread sweep should parse");
   require(config->workload.queue_depths.size() == 2, "queue depth sweep should parse");
   require(config->workload.mixes.size() == 2, "mix sweep should parse");
@@ -195,6 +270,11 @@ void test_invalid_parser_inputs() {
   }));
   require(!server_config.has_value(), "unknown server flag should fail");
 
+  const auto zero_server_threads = rpcbench::parse_server_config(make_args({
+      "--server-threads=0",
+  }));
+  require(!zero_server_threads.has_value(), "zero server thread count should fail");
+
   const auto bench_mode = rpcbench::parse_bench_config(make_args({
                                                            "--mode=bogus",
                                                        }),
@@ -205,7 +285,15 @@ void test_invalid_parser_inputs() {
                                                               "--mode=connect",
                                                           }),
                                                           "/tmp/rpc-bench-bench");
-  require(!bench_connect.has_value(), "connect mode without endpoints should fail");
+  require(!bench_connect.has_value(), "connect mode without an endpoint should fail");
+
+  const auto connect_threads = rpcbench::parse_bench_config(make_args({
+                                                                "--mode=connect",
+                                                                "--endpoint=127.0.0.1:7000",
+                                                                "--server-threads=1",
+                                                            }),
+                                                            "/tmp/rpc-bench-bench");
+  require(!connect_threads.has_value(), "connect mode should reject server thread flag");
 
   const auto bad_mix = rpcbench::parse_bench_config(make_args({
                                                         "--mode=spawn-local",
@@ -214,13 +302,26 @@ void test_invalid_parser_inputs() {
                                                     "/tmp/rpc-bench-bench");
   require(!bad_mix.has_value(), "invalid mix totals should fail");
 
-  const auto bad_ports = rpcbench::parse_bench_config(make_args({
-                                                          "--mode=spawn-local",
-                                                          "--base-port=65535",
-                                                          "--server-workers=2",
-                                                      }),
-                                                      "/tmp/rpc-bench-bench");
-  require(!bad_ports.has_value(), "worker port overflow should fail");
+  const auto removed_endpoints = rpcbench::parse_bench_config(make_args({
+                                                                  "--mode=connect",
+                                                                  "--endpoints=127.0.0.1:7000",
+                                                              }),
+                                                              "/tmp/rpc-bench-bench");
+  require(!removed_endpoints.has_value(), "removed endpoints flag should fail");
+
+  const auto removed_workers = rpcbench::parse_bench_config(make_args({
+                                                                "--mode=spawn-local",
+                                                                "--server-workers=1",
+                                                            }),
+                                                            "/tmp/rpc-bench-bench");
+  require(!removed_workers.has_value(), "removed server workers flag should fail");
+
+  const auto removed_base_port = rpcbench::parse_bench_config(make_args({
+                                                                  "--mode=spawn-local",
+                                                                  "--base-port=7300",
+                                                              }),
+                                                              "/tmp/rpc-bench-bench");
+  require(!removed_base_port.has_value(), "removed base port flag should fail");
 }
 
 void test_storage_backend() {
@@ -243,9 +344,12 @@ void test_storage_backend() {
 void test_usage_and_validation_helpers() {
   const auto server_help = rpcbench::server_usage("rpc-bench-server");
   expect_contains(server_help, "--port=PORT");
+  expect_contains(server_help, "--server-threads=N");
 
   const auto bench_help = rpcbench::bench_usage("rpc-bench-bench");
   expect_contains(bench_help, "--mode=connect|spawn-local");
+  expect_contains(bench_help, "--endpoint=HOST:PORT");
+  expect_contains(bench_help, "--server-port=PORT");
   expect_contains(bench_help, "--json-output=PATH");
 
   rpcbench::WorkloadSpec invalid_workload;
@@ -258,7 +362,14 @@ void test_usage_and_validation_helpers() {
 
   rpcbench::BenchConfig invalid_connect;
   invalid_connect.mode = rpcbench::BenchMode::connect;
-  require(!invalid_connect.validate().has_value(), "connect mode without endpoints should fail");
+  require(!invalid_connect.validate().has_value(), "connect mode without an endpoint should fail");
+
+  rpcbench::BenchConfig invalid_connect_threads;
+  invalid_connect_threads.mode = rpcbench::BenchMode::connect;
+  invalid_connect_threads.endpoint = "127.0.0.1:7000";
+  invalid_connect_threads.server_threads = 2;
+  require(!invalid_connect_threads.validate().has_value(),
+          "connect mode should reject configured server threads");
 }
 
 void test_metrics_rendering() {
@@ -267,7 +378,7 @@ void test_metrics_rendering() {
       .results =
           {
               rpcbench::BenchmarkResult{
-                  .server_workers = 2,
+                  .server_threads = 1,
                   .client_threads = 4,
                   .queue_depth = 8,
                   .key_size = 16,
@@ -280,7 +391,7 @@ void test_metrics_rendering() {
                       },
                   .iteration = 1,
                   .measure_seconds = 1.0,
-                  .endpoints = {"127.0.0.1:7000", "127.0.0.1:7001"},
+                  .endpoint = "127.0.0.1:7000",
                   .counts =
                       rpcbench::OperationCounts{
                           .total_ops = 100,
@@ -311,11 +422,13 @@ void test_metrics_rendering() {
 
   const auto text = report.to_text();
   expect_contains(text, "rpc-bench report");
-  expect_contains(text, "workers=2");
+  expect_contains(text, "serverThreads=1");
+  expect_contains(text, "Endpoint: 127.0.0.1:7000");
   expect_contains(text, "mix=80:20:0");
 
   const auto json = report.to_json();
   expect_contains(json, "\"mode\": \"spawn-local\"");
+  expect_contains(json, "\"serverThreads\": 1");
   expect_contains(json, "\"clientThreads\": 4");
   expect_contains(json, "\"opsPerSecond\": 100.000000");
 }
@@ -326,7 +439,7 @@ void test_metrics_edge_rendering() {
       .results =
           {
               rpcbench::BenchmarkResult{
-                  .server_workers = 1,
+                  .server_threads = 1,
                   .client_threads = 1,
                   .queue_depth = 1,
                   .key_size = 4,
@@ -339,7 +452,7 @@ void test_metrics_edge_rendering() {
                       },
                   .iteration = 1,
                   .measure_seconds = 2.0,
-                  .endpoints = {"127.0.0.1:7311", "quoted\"endpoint\n"},
+                  .endpoint = "quoted\"endpoint\n",
                   .counts =
                       rpcbench::OperationCounts{
                           .total_ops = 1,
@@ -385,9 +498,9 @@ void test_loopback_benchmark() {
   rpcbench::BenchConfig config;
   config.mode = rpcbench::BenchMode::spawn_local;
   config.server_binary = std::filesystem::path(server_path);
-  config.server_workers = {1};
   config.listen_host = "127.0.0.1";
-  config.base_port = test_port(0);
+  config.server_port = test_port(0);
+  config.server_threads = 1;
   config.quiet_server = true;
   config.startup_timeout_ms = 5000;
   config.workload.client_threads = {1};
@@ -411,6 +524,10 @@ void test_loopback_benchmark() {
           report ? "loopback benchmark should succeed"
                  : std::format("loopback benchmark failed: {}", report.error()));
   require(report->results.size() == 1, "loopback benchmark should produce one result");
+  require(report->results.front().server_threads == 1,
+          "loopback benchmark should report one thread");
+  require(report->results.front().endpoint == std::format("127.0.0.1:{}", config.server_port),
+          "loopback benchmark should report the spawned endpoint");
   require(report->results.front().counts.total_ops > 0, "loopback benchmark should record work");
   require(report->results.front().counts.errors == 0, "loopback benchmark should not error");
 }
@@ -425,7 +542,7 @@ void test_connect_mode_loopback() {
 
   rpcbench::BenchConfig config;
   config.mode = rpcbench::BenchMode::connect;
-  config.endpoints = {std::format("127.0.0.1:{}", port)};
+  config.endpoint = std::format("127.0.0.1:{}", port);
   config.workload.client_threads = {1};
   config.workload.queue_depths = {1};
   config.workload.key_sizes = {8};
@@ -447,13 +564,16 @@ void test_connect_mode_loopback() {
           report ? "connect-mode benchmark should succeed"
                  : std::format("connect-mode benchmark failed: {}", report.error()));
   require(report->results.size() == 1, "connect-mode benchmark should produce one result");
+  require(report->results.front().server_threads == 1, "connect-mode should report one thread");
+  require(report->results.front().endpoint == config.endpoint,
+          "connect-mode should report the configured endpoint");
   require(report->results.front().counts.total_ops > 0, "connect-mode benchmark should do work");
 }
 
 void test_connect_mode_dead_endpoint_fails_fast() {
   rpcbench::BenchConfig config;
   config.mode = rpcbench::BenchMode::connect;
-  config.endpoints = {"127.0.0.1:7999"};
+  config.endpoint = "127.0.0.1:7999";
   config.startup_timeout_ms = 100;
   config.workload.client_threads = {1};
   config.workload.queue_depths = {1};
@@ -478,6 +598,41 @@ void test_connect_mode_dead_endpoint_fails_fast() {
   require(elapsed < std::chrono::seconds(2), "dead endpoint failure should be bounded");
 }
 
+void test_spawn_local_server_thread_fallback_warning() {
+  const char* server_path = std::getenv("RPCBENCH_SERVER_PATH"); // NOLINT(concurrency-mt-unsafe)
+  const char* bench_path = std::getenv("RPCBENCH_BENCH_PATH");   // NOLINT(concurrency-mt-unsafe)
+  require(server_path != nullptr, "RPCBENCH_SERVER_PATH must be set");
+  require(bench_path != nullptr, "RPCBENCH_BENCH_PATH must be set");
+
+  const auto port = test_port(2);
+  const auto result = run_process_capture(std::filesystem::path(bench_path),
+                                          {
+                                              "--mode=spawn-local",
+                                              std::format("--server-binary={}", server_path),
+                                              "--listen-host=127.0.0.1",
+                                              std::format("--server-port={}", port),
+                                              "--server-threads=4",
+                                              "--client-threads=1",
+                                              "--queue-depths=1",
+                                              "--key-sizes=8",
+                                              "--value-sizes=16",
+                                              "--mixes=50:50:0",
+                                              "--warmup-seconds=0.02",
+                                              "--measure-seconds=0.05",
+                                              "--iterations=1",
+                                              "--key-space=16",
+                                              "--quiet-server",
+                                          });
+
+  require(result.exit_status == 0, "spawn-local fallback run should succeed");
+  expect_contains(
+      result.stderr_text,
+      "warning: multi-threaded server is not yet implemented; defaulting to single-threaded "
+      "async server");
+  expect_contains(result.stdout_text, "serverThreads=1");
+  expect_contains(result.stdout_text, std::format("Endpoint: 127.0.0.1:{}", port));
+}
+
 } // namespace
 
 int main() {
@@ -492,6 +647,7 @@ int main() {
     test_loopback_benchmark();
     test_connect_mode_loopback();
     test_connect_mode_dead_endpoint_fails_fast();
+    test_spawn_local_server_thread_fallback_warning();
   } catch (const TestFailure& failure) {
     std::fprintf(stderr, "test failure: %s\n", failure.what());
     return 1;

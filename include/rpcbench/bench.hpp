@@ -1,8 +1,9 @@
 #pragma once
 
 // Benchmark execution entry points. The runner expands the configured sweep
-// matrix, manages remote or spawn-local endpoints, and returns fully formatted
-// metric structures without exposing transport details to the frontends.
+// matrix, manages one remote or one spawn-local endpoint per run, and returns
+// fully formatted metric structures without exposing transport details to the
+// frontends.
 
 #include "rpcbench/config.hpp"
 #include "rpcbench/metrics.hpp"

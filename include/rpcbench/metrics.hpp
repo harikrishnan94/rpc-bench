@@ -46,9 +46,9 @@ struct LatencyPercentiles {
 };
 
 struct BenchmarkResult {
-  // Server worker count used for this run. In v1 this equals the number of
-  // endpoints or spawned server processes.
-  std::size_t server_workers = 0;
+  // Effective server thread count used for this run. The current benchmark
+  // always executes against one single-threaded async server.
+  std::size_t server_threads = 0;
 
   // Client thread count used for this run.
   std::size_t client_threads = 0;
@@ -69,8 +69,8 @@ struct BenchmarkResult {
   // Measured duration, in seconds, for the recorded phase.
   double measure_seconds = 0.0;
 
-  // Endpoints used by the run.
-  std::vector<std::string> endpoints;
+  // Endpoint used by the run.
+  std::string endpoint;
 
   // Aggregated operation counts for the run.
   OperationCounts counts;

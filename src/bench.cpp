@@ -1,7 +1,6 @@
-// Benchmark execution engine for local-spawn and remote modes. The core design
-// keeps each EzRpc client thread-affine, expands one explicit sweep matrix, and
-// treats server worker counts as endpoint counts so measurements remain easy to
-// reproduce locally and remotely.
+// Benchmark execution engine for local-spawn and connect modes. The core
+// design keeps each EzRpc client thread-affine, expands one explicit sweep
+// matrix, and targets exactly one endpoint per benchmark run.
 
 #include "rpcbench/bench.hpp"
 
@@ -55,7 +54,7 @@ struct OperationPlan {
 };
 
 struct RunCase {
-  std::size_t server_workers = 0;
+  std::size_t server_threads = 0;
   std::size_t client_threads = 0;
   std::size_t queue_depth = 0;
   std::size_t key_size = 0;
@@ -76,7 +75,19 @@ struct ThreadResult {
 
 struct SpawnedProcess {
   pid_t pid = -1;
-  std::string endpoint;
+
+  SpawnedProcess() = default;
+  SpawnedProcess(const SpawnedProcess&) = delete;
+  SpawnedProcess& operator=(const SpawnedProcess&) = delete;
+
+  SpawnedProcess(SpawnedProcess&& other) noexcept : pid(std::exchange(other.pid, -1)) {}
+
+  SpawnedProcess& operator=(SpawnedProcess&& other) noexcept {
+    if (this != &other) {
+      pid = std::exchange(other.pid, -1);
+    }
+    return *this;
+  }
 };
 
 kj::ArrayPtr<const capnp::byte> as_capnp_bytes(const std::string& value) {
@@ -100,7 +111,7 @@ std::uint64_t mix_seed(const OperationMix& mix) {
 }
 
 std::uint64_t derive_seed(const RunCase& run, std::size_t thread_index, std::uint64_t seed) {
-  return seed ^ (run.server_workers * 0x9e3779b185ebca87ULL) ^
+  return seed ^ (run.server_threads * 0x9e3779b185ebca87ULL) ^
          (run.client_threads * 0xc2b2ae3d27d4eb4fULL) ^ (run.queue_depth * 0x165667b19e3779f9ULL) ^
          (run.key_size * 0x85ebca77c2b2ae63ULL) ^ (run.value_size * 0x27d4eb2f165667c5ULL) ^
          (mix_seed(run.mix) * 0x94d049bb133111ebULL) ^
@@ -126,7 +137,6 @@ std::expected<pid_t, std::string> spawn_process(const std::filesystem::path& pro
       const int dev_null = open("/dev/null", O_WRONLY);
       if (dev_null >= 0) {
         dup2(dev_null, STDOUT_FILENO);
-        dup2(dev_null, STDERR_FILENO);
         close(dev_null);
       }
     }
@@ -273,76 +283,64 @@ std::expected<void, std::string> wait_for_endpoint_ready(std::string_view endpoi
   return std::unexpected(std::format("endpoint did not become ready: {}", endpoint));
 }
 
-class SpawnedServerCluster {
-  // Owns the local server processes for one worker-count matrix slice. The
-  // benchmark runner keeps the cluster alive across client-side sweeps so each
-  // run can reset state with a prefill pass instead of a full process restart.
+class SpawnedServerInstance {
+  // Owns the one local server process used by spawn-local mode. The benchmark
+  // runner keeps the process alive across matrix points so each run can reset
+  // state with a prefill pass instead of a full process restart.
 public:
-  SpawnedServerCluster() = default;
-  SpawnedServerCluster(const SpawnedServerCluster&) = delete;
-  SpawnedServerCluster& operator=(const SpawnedServerCluster&) = delete;
+  SpawnedServerInstance() = default;
+  SpawnedServerInstance(const SpawnedServerInstance&) = delete;
+  SpawnedServerInstance& operator=(const SpawnedServerInstance&) = delete;
 
-  SpawnedServerCluster(SpawnedServerCluster&&) = default;
-  SpawnedServerCluster& operator=(SpawnedServerCluster&&) = default;
+  SpawnedServerInstance(SpawnedServerInstance&&) = default;
+  SpawnedServerInstance& operator=(SpawnedServerInstance&&) = default;
 
-  ~SpawnedServerCluster() {
-    for (const auto& process : processes_) {
-      stop_process(process);
-    }
+  ~SpawnedServerInstance() {
+    stop_process(process_);
   }
 
-  static std::expected<SpawnedServerCluster, std::string> spawn(const BenchConfig& config,
-                                                                std::size_t worker_count) {
-    SpawnedServerCluster cluster;
+  static std::expected<SpawnedServerInstance, std::string> spawn(const BenchConfig& config) {
+    SpawnedServerInstance server;
     const auto program = std::filesystem::absolute(config.server_binary);
 
-    for (std::size_t index = 0; index < worker_count; ++index) {
-      const auto port = static_cast<std::uint16_t>(config.base_port + index);
-      const auto endpoint = make_endpoint(config.listen_host, port);
-      std::vector<std::string> arguments{
-          std::format("--listen-host={}", config.listen_host),
-          std::format("--port={}", port),
-      };
-      if (config.quiet_server) {
-        arguments.emplace_back("--quiet");
-      }
-
-      auto pid = spawn_process(program, arguments, config.quiet_server);
-      if (!pid) {
-        return std::unexpected(pid.error());
-      }
-
-      cluster.processes_.push_back(SpawnedProcess{
-          .pid = *pid,
-          .endpoint = endpoint,
-      });
-      cluster.endpoints_.push_back(endpoint);
+    server.endpoint_ = make_endpoint(config.listen_host, config.server_port);
+    std::vector<std::string> arguments{
+        std::format("--listen-host={}", config.listen_host),
+        std::format("--port={}", config.server_port),
+        std::format("--server-threads={}", config.server_threads),
+    };
+    if (config.quiet_server) {
+      arguments.emplace_back("--quiet");
     }
 
-    for (const auto& endpoint : cluster.endpoints_) {
-      auto ready =
-          wait_for_endpoint_ready(endpoint, std::chrono::milliseconds(config.startup_timeout_ms));
-      if (!ready) {
-        return std::unexpected(ready.error());
-      }
+    auto pid = spawn_process(program, arguments, config.quiet_server);
+    if (!pid) {
+      return std::unexpected(pid.error());
     }
 
-    return cluster;
+    server.process_.pid = *pid;
+    auto ready = wait_for_endpoint_ready(server.endpoint_,
+                                         std::chrono::milliseconds(config.startup_timeout_ms));
+    if (!ready) {
+      return std::unexpected(ready.error());
+    }
+
+    return server;
   }
 
-  [[nodiscard]] const std::vector<std::string>& endpoints() const {
-    return endpoints_;
+  [[nodiscard]] const std::string& endpoint() const {
+    return endpoint_;
   }
 
 private:
-  std::vector<SpawnedProcess> processes_;
-  std::vector<std::string> endpoints_;
+  SpawnedProcess process_;
+  std::string endpoint_;
 };
 
 class WorkloadGenerator {
   // Produces deterministic thread-local keys, values, and operation choices for
   // one benchmark thread. Each thread owns its own logical key-space so a
-  // thread can remain bound to one endpoint without cross-thread client usage.
+  // thread can stay bound to the run's endpoint without cross-thread clients.
 public:
   struct Config {
     std::size_t thread_index = 0;
@@ -455,8 +453,8 @@ public:
 
 private:
   void prefill() {
-    // Prefill keeps each measured iteration comparable even when endpoints are
-    // reused across multiple matrix points or remote runs.
+    // Prefill keeps each measured iteration comparable even when the endpoint
+    // is reused across multiple matrix points or remote runs.
     for (std::size_t slot = 0; slot < generator_.key_space(); ++slot) {
       auto request = service_.putRequest();
       const auto key = generator_.make_key(slot);
@@ -664,7 +662,7 @@ void merge_counts(OperationCounts& target, const OperationCounts& source) {
   target.response_bytes += source.response_bytes;
 }
 
-std::vector<RunCase> build_cases(std::size_t server_workers, const WorkloadSpec& workload) {
+std::vector<RunCase> build_cases(std::size_t server_threads, const WorkloadSpec& workload) {
   std::vector<RunCase> cases;
 
   for (const auto client_threads : workload.client_threads) {
@@ -674,7 +672,7 @@ std::vector<RunCase> build_cases(std::size_t server_workers, const WorkloadSpec&
           for (const auto& mix : workload.mixes) {
             for (std::uint32_t iteration = 1; iteration <= workload.iterations; ++iteration) {
               cases.push_back(RunCase{
-                  .server_workers = server_workers,
+                  .server_threads = server_threads,
                   .client_threads = client_threads,
                   .queue_depth = queue_depth,
                   .key_size = key_size,
@@ -692,17 +690,15 @@ std::vector<RunCase> build_cases(std::size_t server_workers, const WorkloadSpec&
   return cases;
 }
 
-std::expected<BenchmarkResult, std::string> run_case(const std::vector<std::string>& endpoints,
-                                                     const RunCase& run,
-                                                     const WorkloadSpec& workload) {
+std::expected<BenchmarkResult, std::string>
+run_case(const std::string& endpoint, const RunCase& run, const WorkloadSpec& workload) {
   std::vector<ThreadResult> thread_results(run.client_threads);
   std::vector<std::thread> threads;
   threads.reserve(run.client_threads);
 
   for (std::size_t thread_index = 0; thread_index < run.client_threads; ++thread_index) {
     threads.emplace_back([&, thread_index] {
-      ThreadSession session(
-          endpoints[thread_index % endpoints.size()], run, workload, thread_index);
+      ThreadSession session(endpoint, run, workload, thread_index);
       auto result = session.execute();
       if (!result) {
         thread_results[thread_index].error = result.error();
@@ -741,7 +737,7 @@ std::expected<BenchmarkResult, std::string> run_case(const std::vector<std::stri
   const auto mib_per_second = measured_bytes / workload.measure_seconds / (1024.0 * 1024.0);
 
   return BenchmarkResult{
-      .server_workers = run.server_workers,
+      .server_threads = run.server_threads,
       .client_threads = run.client_threads,
       .queue_depth = run.queue_depth,
       .key_size = run.key_size,
@@ -749,7 +745,7 @@ std::expected<BenchmarkResult, std::string> run_case(const std::vector<std::stri
       .mix = run.mix,
       .iteration = run.iteration,
       .measure_seconds = workload.measure_seconds,
-      .endpoints = endpoints,
+      .endpoint = endpoint,
       .counts = counts,
       .latency = compute_percentiles(std::move(latencies)),
       .ops_per_second = ops_per_second,
@@ -762,6 +758,8 @@ std::expected<BenchmarkResult, std::string> run_case(const std::vector<std::stri
 BenchmarkRunner::BenchmarkRunner(BenchConfig config) : config_(std::move(config)) {}
 
 std::expected<BenchmarkReport, std::string> BenchmarkRunner::run() const {
+  constexpr std::size_t effective_server_threads = 1;
+
   if (auto valid = config_.validate(); !valid) {
     return std::unexpected(valid.error());
   }
@@ -770,17 +768,15 @@ std::expected<BenchmarkReport, std::string> BenchmarkRunner::run() const {
   report.mode = config_.mode;
 
   if (config_.mode == BenchMode::connect) {
-    for (const auto& endpoint : config_.endpoints) {
-      auto ready =
-          wait_for_endpoint_ready(endpoint, std::chrono::milliseconds(config_.startup_timeout_ms));
-      if (!ready) {
-        return std::unexpected(ready.error());
-      }
+    auto ready = wait_for_endpoint_ready(config_.endpoint,
+                                         std::chrono::milliseconds(config_.startup_timeout_ms));
+    if (!ready) {
+      return std::unexpected(ready.error());
     }
 
-    const auto cases = build_cases(config_.endpoints.size(), config_.workload);
+    const auto cases = build_cases(effective_server_threads, config_.workload);
     for (const auto& run : cases) {
-      auto result = run_case(config_.endpoints, run, config_.workload);
+      auto result = run_case(config_.endpoint, run, config_.workload);
       if (!result) {
         return std::unexpected(result.error());
       }
@@ -789,20 +785,18 @@ std::expected<BenchmarkReport, std::string> BenchmarkRunner::run() const {
     return report;
   }
 
-  for (const auto worker_count : config_.server_workers) {
-    auto cluster = SpawnedServerCluster::spawn(config_, worker_count);
-    if (!cluster) {
-      return std::unexpected(cluster.error());
-    }
+  auto server = SpawnedServerInstance::spawn(config_);
+  if (!server) {
+    return std::unexpected(server.error());
+  }
 
-    const auto cases = build_cases(worker_count, config_.workload);
-    for (const auto& run : cases) {
-      auto result = run_case(cluster->endpoints(), run, config_.workload);
-      if (!result) {
-        return std::unexpected(result.error());
-      }
-      report.results.push_back(std::move(*result));
+  const auto cases = build_cases(effective_server_threads, config_.workload);
+  for (const auto& run : cases) {
+    auto result = run_case(server->endpoint(), run, config_.workload);
+    if (!result) {
+      return std::unexpected(result.error());
     }
+    report.results.push_back(std::move(*result));
   }
 
   return report;

@@ -9,6 +9,7 @@ test(
   'rpc-bench-tests',
   rpc_bench_tests,
   env : [
+    'RPCBENCH_BENCH_PATH=' + bench_exe.full_path(),
     'RPCBENCH_SERVER_PATH=' + server_exe.full_path(),
   ],
 )
@@ -18,8 +19,8 @@ benchmark(
   bench_exe,
   args : [
     '--mode=spawn-local',
-    '--base-port=47300',
-    '--server-workers=1',
+    '--server-port=47300',
+    '--server-threads=1',
     '--client-threads=1',
     '--queue-depths=1',
     '--key-sizes=16',

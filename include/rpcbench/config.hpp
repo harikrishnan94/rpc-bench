@@ -78,6 +78,10 @@ struct ServerConfig {
   // TCP port that the server process listens on.
   std::uint16_t port = 7000;
 
+  // Requested server thread count. Values above 1 currently warn at startup
+  // and fall back to the single-threaded async server implementation.
+  std::size_t server_threads = 1;
+
   // Suppresses the startup banner when true.
   bool quiet = false;
 
@@ -86,12 +90,13 @@ struct ServerConfig {
 };
 
 struct BenchConfig {
-  // Selects whether the benchmark connects to existing endpoints or spawns
-  // local server processes automatically.
+  // Selects whether the benchmark connects to one existing endpoint or spawns
+  // one local server process automatically.
   BenchMode mode = BenchMode::spawn_local;
 
-  // Endpoints used by connect mode. Each endpoint owns one shard.
-  std::vector<std::string> endpoints;
+  // Endpoint used by connect mode. The benchmark accepts exactly one endpoint
+  // per run in this version.
+  std::string endpoint;
 
   // Path to the server binary used by spawn-local mode.
   std::filesystem::path server_binary = "rpc-bench-server";
@@ -99,13 +104,12 @@ struct BenchConfig {
   // Host used for spawn-local server processes.
   std::string listen_host = "127.0.0.1";
 
-  // First port used for spawn-local server processes. Additional workers use
-  // consecutive ports.
-  std::uint16_t base_port = 7300;
+  // TCP port used for the single spawn-local server process.
+  std::uint16_t server_port = 7300;
 
-  // Server worker counts to sweep in spawn-local mode. Each worker count maps
-  // to one server process per endpoint.
-  std::vector<std::size_t> server_workers{1};
+  // Requested spawn-local server thread count. Connect mode does not allow the
+  // benchmark to configure remote server thread counts.
+  std::size_t server_threads = 1;
 
   // Benchmark matrix, timing, and workload settings.
   WorkloadSpec workload;
@@ -113,10 +117,11 @@ struct BenchConfig {
   // Optional file path for JSON report emission.
   std::optional<std::filesystem::path> json_output;
 
-  // Suppresses child-process server logs in spawn-local mode when true.
+  // Suppresses child-process startup banners in spawn-local mode when true.
+  // Warnings and errors still use stderr.
   bool quiet_server = false;
 
-  // Deadline for waiting on spawned endpoints to become reachable.
+  // Deadline for waiting on the configured endpoint to become reachable.
   std::uint32_t startup_timeout_ms = 5000;
 
   // Validates the mode-specific fields and embedded workload configuration.

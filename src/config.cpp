@@ -87,24 +87,6 @@ std::expected<std::vector<std::size_t>, std::string> parse_size_list(std::string
   return values;
 }
 
-std::expected<std::vector<std::string>, std::string> parse_string_list(std::string_view text,
-                                                                       const char* name) {
-  std::vector<std::string> values;
-
-  for (const auto part : split_list(text, ',')) {
-    if (part.empty()) {
-      return std::unexpected(std::format("invalid {} list: empty entry", name));
-    }
-    values.emplace_back(part);
-  }
-
-  if (values.empty()) {
-    return std::unexpected(std::format("{} list must not be empty", name));
-  }
-
-  return values;
-}
-
 std::expected<std::vector<OperationMix>, std::string> parse_mix_list(std::string_view text) {
   std::vector<OperationMix> mixes;
 
@@ -259,26 +241,19 @@ std::expected<void, std::string> BenchConfig::validate() const {
 
   switch (mode) {
   case BenchMode::connect:
-    if (endpoints.empty()) {
-      return std::unexpected("connect mode requires at least one endpoint");
+    if (endpoint.empty()) {
+      return std::unexpected("connect mode requires exactly one endpoint");
+    }
+    if (server_threads != 1) {
+      return std::unexpected("connect mode does not support configuring server threads");
     }
     break;
   case BenchMode::spawn_local:
-    if (server_workers.empty()) {
-      return std::unexpected("spawn-local mode requires at least one server worker count");
+    if (server_port == 0) {
+      return std::unexpected("server port must be in the range 1-65535");
     }
-    if (std::ranges::any_of(server_workers, [](const auto value) { return value == 0; })) {
-      return std::unexpected("server worker counts must be greater than zero");
-    }
-    if (base_port == 0) {
-      return std::unexpected("base port must be in the range 1-65535");
-    }
-    if (!server_workers.empty()) {
-      const auto max_workers = *std::ranges::max_element(server_workers);
-      const auto last_port = static_cast<std::uint64_t>(base_port) + max_workers - 1;
-      if (last_port > std::numeric_limits<std::uint16_t>::max()) {
-        return std::unexpected("spawn-local worker counts exceed the available port range");
-      }
+    if (server_threads == 0) {
+      return std::unexpected("server thread count must be greater than zero");
     }
     if (server_binary.empty()) {
       return std::unexpected("spawn-local mode requires a server binary path");
@@ -313,6 +288,18 @@ parse_server_config(std::span<const std::string_view> args) {
       continue;
     }
 
+    if (const auto value = get_value(arg, "--server-threads=")) {
+      auto parsed = parse_integer<unsigned int>(*value, "server thread count");
+      if (!parsed) {
+        return std::unexpected(parsed.error());
+      }
+      if (*parsed == 0) {
+        return std::unexpected("server thread count must be greater than zero");
+      }
+      config.server_threads = static_cast<std::size_t>(*parsed);
+      continue;
+    }
+
     return std::unexpected(std::format("unknown server argument '{}'", arg));
   }
 
@@ -323,6 +310,7 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
                                                            const std::filesystem::path& argv0) {
   BenchConfig config;
   config.server_binary = default_server_binary(argv0);
+  bool saw_server_threads = false;
 
   for (const auto arg : args) {
     if (has_flag(arg, "--quiet-server")) {
@@ -341,12 +329,8 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
       continue;
     }
 
-    if (const auto value = get_value(arg, "--endpoints=")) {
-      auto parsed = parse_string_list(*value, "endpoint");
-      if (!parsed) {
-        return std::unexpected(parsed.error());
-      }
-      config.endpoints = std::move(*parsed);
+    if (const auto value = get_value(arg, "--endpoint=")) {
+      config.endpoint = std::string(*value);
       continue;
     }
 
@@ -360,21 +344,22 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
       continue;
     }
 
-    if (const auto value = get_value(arg, "--base-port=")) {
-      auto parsed = parse_port(*value, "base port");
+    if (const auto value = get_value(arg, "--server-port=")) {
+      auto parsed = parse_port(*value, "server port");
       if (!parsed) {
         return std::unexpected(parsed.error());
       }
-      config.base_port = *parsed;
+      config.server_port = *parsed;
       continue;
     }
 
-    if (const auto value = get_value(arg, "--server-workers=")) {
-      auto parsed = parse_size_list<unsigned int>(*value, "server worker");
+    if (const auto value = get_value(arg, "--server-threads=")) {
+      auto parsed = parse_integer<unsigned int>(*value, "server thread count");
       if (!parsed) {
         return std::unexpected(parsed.error());
       }
-      config.server_workers = std::move(*parsed);
+      config.server_threads = static_cast<std::size_t>(*parsed);
+      saw_server_threads = true;
       continue;
     }
 
@@ -485,6 +470,11 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
     return std::unexpected(std::format("unknown benchmark argument '{}'", arg));
   }
 
+  if (config.mode == BenchMode::connect && saw_server_threads) {
+    return std::unexpected("invalid connect benchmark configuration: connect mode does not accept "
+                           "--server-threads");
+  }
+
   if (auto valid = config.validate(); !valid) {
     return std::unexpected(std::format(
         "invalid {} benchmark configuration: {}", bench_mode_name(config.mode), valid.error()));
@@ -494,12 +484,14 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
 }
 
 std::string server_usage(std::string_view program_name) {
-  return std::format("{} [--listen-host=HOST] [--port=PORT] [--quiet]\n"
+  return std::format("{} [--listen-host=HOST] [--port=PORT] [--server-threads=N] [--quiet]\n"
                      "\n"
                      "Options:\n"
-                     "  --listen-host=HOST   Host or address to bind. Default: 127.0.0.1\n"
-                     "  --port=PORT          TCP port to bind. Default: 7000\n"
-                     "  --quiet              Suppress the startup banner\n",
+                     "  --listen-host=HOST    Host or address to bind. Default: 127.0.0.1\n"
+                     "  --port=PORT           TCP port to bind. Default: 7000\n"
+                     "  --server-threads=N    Requested thread count. Values above 1 warn and\n"
+                     "                        fall back to the single-threaded async server\n"
+                     "  --quiet               Suppress the startup banner\n",
                      program_name);
 }
 
@@ -521,15 +513,15 @@ std::string bench_usage(std::string_view program_name) {
                      "  --json-output=PATH         Write JSON report to PATH\n"
                      "\n"
                      "Connect mode options:\n"
-                     "  --endpoints=LIST           Comma-separated host:port endpoints\n"
+                     "  --endpoint=HOST:PORT       Single remote endpoint to benchmark\n"
                      "\n"
                      "Spawn-local mode options:\n"
                      "  --server-binary=PATH       Server binary path\n"
-                     "  --listen-host=HOST         Host used for spawned endpoints\n"
-                     "  --base-port=PORT           First port used for spawned endpoints\n"
-                     "  --server-workers=LIST      Comma-separated worker counts to sweep\n"
+                     "  --listen-host=HOST         Host used for the spawned endpoint\n"
+                     "  --server-port=PORT         Port used for the spawned endpoint\n"
+                     "  --server-threads=N         Requested local server thread count\n"
                      "  --startup-timeout-ms=N     Spawn readiness timeout in milliseconds\n"
-                     "  --quiet-server             Suppress child server logs\n",
+                     "  --quiet-server             Suppress child server stdout\n",
                      program_name);
 
   return out.str();
