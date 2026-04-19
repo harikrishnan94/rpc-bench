@@ -8,25 +8,34 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rpcbench {
 
 struct ServerConfig {
-  // Host or address string to bind. The value is preserved for the startup
-  // banner so operators can see the configured listen target directly.
-  std::string listen_host = "127.0.0.1";
-
-  // TCP port for the listener.
-  std::uint16_t port = 7000;
+  // URI that defines the server transport and listen target.
+  TransportUri listen_uri{
+      .kind = TransportKind::tcp,
+      .location = "127.0.0.1",
+      .port = 7000,
+  };
 
   // Suppresses the startup banner when true.
   bool quiet = false;
 
-  // Returns the configured listen endpoint.
-  [[nodiscard]] Endpoint endpoint() const;
+  // Internal ready notification fd used by spawn-local mode.
+  std::optional<int> ready_fd;
+
+  // Internal inherited server-side stream fds for pipe://socketpair.
+  std::vector<int> preconnected_stream_fds;
+
+  // Internal control socket fd and slot count for shm://NAME.
+  std::optional<int> shm_control_fd;
+  std::size_t shm_slot_count = 0;
 };
 
 // Parses `rpc-bench-server` command-line arguments.

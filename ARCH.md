@@ -2,16 +2,15 @@
 
 ## Overview
 
-`rpc-bench` measures one simple remote service: a unary Cap'n Proto RPC whose
-result is the CRC32 hash of a request payload. The observable system consists
-of:
+`rpc-bench` measures one simple remote service: a unary RPC whose result is the
+CRC32 hash of a request payload. The observable system consists of:
 
 - an internal `protocol` library shared by both frontends
-- `rpc-bench-server`, a single-endpoint hash server
-- `rpc-bench-bench`, a benchmark driver that runs against one endpoint
+- `rpc-bench-server`, a single-listen-target hash server
+- `rpc-bench-bench`, a benchmark driver that runs against one target
 
 The implementation is intentionally small and explicit. This version does not
-define persistence, sharding, multi-endpoint runs, or multi-threaded server
+define persistence, sharding, multi-target runs, or multi-threaded server
 execution.
 
 ## Service Semantics
@@ -34,45 +33,100 @@ The server exposes one internal Cap'n Proto interface:
 - If a benchmark configuration requests payloads above 1 MiB, the CLI rejects
   the run before it starts.
 - If a direct RPC caller submits a payload above 1 MiB, the server rejects the
-  call as an application/RPC failure.
-- If a connection breaks during connect, request, or response handling, the
-  affected client thread fails without affecting other benchmark threads.
+  call as an application or RPC failure.
+- If a session breaks during connect, request, or response handling, the
+  affected worker fails without affecting other workers.
+
+## Transport Semantics
+
+### Public URI surface
+
+The user-visible transport identifier is always a URI.
+
+Supported URI kinds:
+
+- `tcp://HOST:PORT`
+- `unix:///absolute/path`
+- `pipe://socketpair`
+- `shm://NAME`
+
+### Transport boundary
+
+- `tcp://...` uses KJ `NetworkAddress` and `ConnectionReceiver`.
+- `unix://...` uses KJ `NetworkAddress` and `ConnectionReceiver`.
+- `pipe://socketpair` uses one pre-connected stream per worker.
+- `shm://NAME` uses shared-memory request and response rings plus a control
+  socket for init and wake notifications.
+
+### Mode restrictions
+
+- `connect` is defined only for `tcp://...` and `unix://...`.
+- `spawn-local` is defined for all supported URI kinds.
+- `pipe://socketpair` and `shm://NAME` are local-only transports in this
+  milestone.
 
 ## Server Semantics
 
 ### Runtime model
 
-- One process owns one KJ async event loop.
-- One process listens on one endpoint.
+- One server process owns one KJ async event loop.
+- The same KJ event loop invariant holds for every transport.
+- Every accepted or pre-created session is serviced through one
+  `TwoPartyVatNetwork` plus one `RpcSystem`.
 - The server is single-threaded at the request-processing level in this
   milestone.
-- The server uses a single bootstrap capability and Cap'n Proto two-party RPC
-  to service accepted connections.
+- The server exports one bootstrap capability that implements the hash RPC.
+
+### Transport-specific session setup
+
+- For `tcp://...` and `unix://...`, the server resolves the URI through KJ,
+  binds one listener, and accepts streams from that listener.
+- For `pipe://socketpair`, the benchmark parent creates one socketpair per
+  worker before spawning the child server. The child wraps the inherited server
+  ends into KJ streams and serves them as pre-connected RPC sessions.
+- For `shm://NAME`, the benchmark parent creates the shared-memory region and a
+  control socket before spawning the child server. The child maps the region,
+  creates one `ShmMessageStream` per slot, and runs a KJ task on the control
+  socket to receive init and wake messages.
 
 ### Lifecycle
 
-- The server binds before it starts waiting for shutdown signals.
-- Unless `--quiet` is set, it prints one startup banner with the bound
-  endpoint.
+- The server completes its transport-specific startup before notifying the
+  benchmark parent that spawn-local startup is ready.
+- Unless `--quiet` is set, it prints one startup banner with the bound or
+  configured URI.
 - `SIGINT` and `SIGTERM` are captured through KJ's Unix event port and cancel
-  the listener from within the event loop.
+  server work from within the event loop.
 - After shutdown is requested, the process exits the event loop and terminates.
 
 ## Benchmark Semantics
 
 ### Run modes
 
-- `connect` benchmarks one already running endpoint.
-- `spawn-local` starts one local child `rpc-bench-server`, waits for the
-  endpoint to answer a probe RPC, runs the workload, and then stops the child.
+- `connect` benchmarks one already running server over `tcp://...` or
+  `unix://...`.
+- `spawn-local` starts one local `rpc-bench-server` child, waits for startup
+  readiness, runs the workload, and then stops the child.
 
-Every benchmark invocation targets exactly one endpoint.
+Every benchmark invocation targets exactly one URI.
+
+### Spawn-local transport setup
+
+- For `tcp://...` and `unix://...`, the benchmark passes `--listen-uri=URI` to
+  the child and waits for a startup-ready signal.
+- For `pipe://socketpair`, the benchmark creates one socketpair per worker,
+  inherits the server ends into the child, and keeps the parent ends for the
+  worker threads.
+- For `shm://NAME`, the benchmark creates one shared-memory region with one slot
+  per worker, starts a parent-side broker thread for control-socket reads,
+  sends one init control frame per slot, waits for the child to acknowledge
+  startup readiness, and then runs the workload.
 
 ### Client concurrency model
 
 - `client_threads` means one OS thread per logical benchmark worker.
 - Each worker thread owns one KJ event loop.
-- Each worker thread owns one RPC connection for the entire run.
+- Each worker thread owns one RPC session for the entire run.
 - Each worker thread keeps exactly one request outstanding at a time.
 
 This is a closed-loop benchmark. A worker sends the next RPC only after the
@@ -119,39 +173,53 @@ the same core fields.
 
 ## Implementation Structure
 
-- `src/protocol/`: internal schema generation, payload-limit validation,
-  endpoint parsing, and CRC32 implementation
-- `src/server/`: CLI parsing plus the KJ listener lifecycle and bootstrap
-  capability
-- `src/bench/`: CLI parsing, child-process management for `spawn-local`,
-  workload generation, RPC client loops, metric aggregation, and report
-  rendering
+- `src/protocol/`: schema generation, payload-limit validation, URI parsing,
+  CRC32 implementation, and the shared-memory transport helpers
+- `src/server/`: CLI parsing, transport-specific server startup, session setup,
+  and bootstrap capability wiring
+- `src/bench/`: CLI parsing, child-process management, spawn-local transport
+  setup, workload generation, RPC client loops, and report rendering
 
 The protocol layer is internal-only. This repository does not expose or install
 a public SDK surface in this version.
 
 ## Design Decisions And Trade-offs
 
-### Why Cap'n Proto RPC over KJ
+### Why keep every server transport on one KJ event loop
 
-The implementation goal for this milestone is to replace the Asio-based
-transport/runtime stack with Cap'n Proto RPC while keeping the CLI and report
-surface stable. Cap'n Proto's generated interfaces and KJ event loop provide an
-explicit RPC stack without introducing a separate application-specific protocol
-parser.
+The benchmark is intended to compare transport paths without changing the basic
+server execution model. Keeping all transports on one KJ event loop removes a
+major source of runtime variation and keeps shutdown behavior consistent.
 
-### Why a system-installed Cap'n Proto toolchain
+### Why use `TwoPartyVatNetwork` plus `RpcSystem` everywhere
 
-This repository carries no bundled dependency-acquisition path. The build must
-use the operator's installed `capnp`, `capnpc-c++`, and pkg-config-visible
-libraries so configuration failures point directly at the local toolchain state
-instead of silently downloading another copy.
+Using the same RPC plumbing for stream-backed transports and custom
+message-stream transports keeps the hash service implementation transport-agnostic.
+The trade-off is that even the local-only transports still speak Cap'n Proto RPC
+messages internally rather than a smaller custom protocol.
 
-### Why keep one outstanding request per connection
+### Why `pipe://socketpair` and `shm://NAME` are spawn-local only
 
-One in-flight request per connection keeps RTT semantics unambiguous and matches
-the benchmark's user-visible concurrency model. The trade-off is that this
-version does not explore pipelining or open-loop traffic generation.
+Both transports depend on benchmark-owned process setup:
+
+- `pipe://socketpair` requires inherited pre-connected descriptors
+- `shm://NAME` requires shared-memory creation plus control-socket coordination
+
+Restricting them to spawn-local mode keeps the public CLI simple and avoids
+defining a separate external rendezvous protocol for local-only transports.
+
+### Why shared memory stays hybrid instead of pure polling
+
+The shared-memory transport moves message bytes through rings, but it still uses
+a control socket for init and wake notifications. That keeps the server driven
+by the KJ event loop instead of introducing a non-KJ polling loop just for
+shared memory.
+
+### Why keep one outstanding request per worker
+
+One in-flight request per worker keeps RTT semantics unambiguous and matches the
+benchmark's user-visible concurrency model. The trade-off is that this version
+does not explore pipelining or open-loop traffic generation.
 
 ### Why preserve legacy byte counters
 
@@ -163,8 +231,8 @@ rather than literal on-the-wire Cap'n Proto sizes.
 ## Non-goals For This Milestone
 
 - multi-threaded server execution
-- multiple endpoints in one benchmark invocation
+- multiple targets in one benchmark invocation
 - persistence or recovery semantics
-- backward compatibility with the deleted raw framed TCP transport
+- remote or non-POSIX variants of `pipe://socketpair` and `shm://NAME`
 - a public reusable client or server SDK
 - repo-managed automated tests or coverage-report plumbing

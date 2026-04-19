@@ -22,15 +22,18 @@ struct BenchConfig {
   // one local child server automatically.
   BenchMode mode = BenchMode::spawn_local;
 
-  // Endpoint for connect mode.
-  Endpoint endpoint;
+  // URI for connect mode.
+  std::optional<TransportUri> connect_uri;
 
   // Path to the server binary used by spawn-local mode.
   std::filesystem::path server_binary;
 
-  // Host and port for the spawned local server.
-  std::string listen_host = "127.0.0.1";
-  std::uint16_t server_port = 7300;
+  // URI for the spawned local server.
+  TransportUri listen_uri{
+      .kind = TransportKind::tcp,
+      .location = "127.0.0.1",
+      .port = 7300,
+  };
 
   // One client thread and one RPC connection per thread.
   std::size_t client_threads = 1;
@@ -57,8 +60,8 @@ struct BenchConfig {
   // Validates the mode-specific settings and size range.
   [[nodiscard]] std::expected<void, std::string> validate() const;
 
-  // Returns the effective endpoint for this run.
-  [[nodiscard]] Endpoint resolved_endpoint() const;
+  // Returns the effective URI for this run.
+  [[nodiscard]] TransportUri resolved_uri() const;
 };
 
 struct LatencyPercentiles {

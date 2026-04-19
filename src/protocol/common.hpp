@@ -1,8 +1,8 @@
 #pragma once
 
-// Shared endpoint, payload-limit, and CLI helpers for the CRC32 benchmark.
-// Keeping these rules in one internal header ensures the server, benchmark, and
-// tests all enforce the same user-visible contract.
+// Shared transport-URI, payload-limit, and CLI helpers for the CRC32
+// benchmark. Keeping these rules in one internal header ensures the server and
+// benchmark enforce the same user-visible transport contract.
 
 #include <charconv>
 #include <cstddef>
@@ -24,15 +24,30 @@ enum class BenchMode : std::uint8_t {
   spawn_local,
 };
 
-struct Endpoint {
-  // TCP endpoint used by the benchmark client or server child management. The
-  // host field is preserved exactly as configured so text reports stay stable.
-  std::string host;
+enum class TransportKind : std::uint8_t {
+  unspecified,
+  tcp,
+  unix_socket,
+  pipe_socketpair,
+  shared_memory,
+};
+
+struct TransportUri {
+  // Unified transport target shared by the benchmark and server CLIs. TCP
+  // stores host + port, Unix sockets store an absolute path, and the local-only
+  // transports store their logical identifier in `location`.
+  TransportKind kind = TransportKind::unspecified;
+  std::string location;
   std::uint16_t port = 0;
 
-  // Returns a stable human-readable endpoint string. IPv6 literals are wrapped
-  // in brackets so the result can round-trip through the parser.
+  // Returns the stable user-facing URI string.
   [[nodiscard]] std::string to_string() const;
+
+  // Returns the equivalent KJ network address for stream-backed transports.
+  [[nodiscard]] std::expected<std::string, std::string> to_kj_address() const;
+
+  // Returns true when the URI is implemented through KJ's NetworkAddress API.
+  [[nodiscard]] bool uses_kj_network() const;
 };
 
 struct MessageSizeRange {
@@ -70,8 +85,8 @@ std::expected<Integer, std::string> parse_integer(std::string_view text, std::st
 // Parses the benchmark mode token accepted by the benchmark CLI.
 [[nodiscard]] std::expected<BenchMode, std::string> parse_bench_mode(std::string_view text);
 
-// Parses one endpoint string in HOST:PORT or [IPv6]:PORT form.
-[[nodiscard]] std::expected<Endpoint, std::string> parse_endpoint(std::string_view text);
+// Parses one user-facing transport URI.
+[[nodiscard]] std::expected<TransportUri, std::string> parse_transport_uri(std::string_view text);
 
 // Resolves a sibling binary next to the current executable path.
 [[nodiscard]] std::filesystem::path sibling_binary_path(const std::filesystem::path& argv0,

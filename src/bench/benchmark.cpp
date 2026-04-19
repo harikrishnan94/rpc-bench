@@ -5,23 +5,29 @@
 #include "bench/benchmark.hpp"
 
 #include "protocol/hash_service.capnp.h"
+#include "protocol/shm_transport.hpp"
 
 #include <algorithm>
 #include <barrier>
 #include <capnp/rpc-twoparty.h>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <exception>
+#include <fcntl.h>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <kj/async-io.h>
 #include <kj/exception.h>
 #include <kj/string.h>
+#include <memory>
+#include <poll.h>
 #include <random>
 #include <span>
 #include <string_view>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -92,6 +98,94 @@ struct SpawnedProcess {
       pid = -1;
     }
   }
+};
+
+struct ReadyPipe {
+  // Spawn-local modes use this pipe to learn when the child server finished its
+  // transport-specific startup path and is ready for the benchmark parent to
+  // proceed.
+  kj::AutoCloseFd read_end;
+  kj::AutoCloseFd write_end;
+};
+
+class ShmBenchmarkTransport;
+
+struct WorkerTransport {
+  // Each benchmark worker owns at most one inherited preconnected stream. The
+  // network-backed transports leave this empty and connect normally. Shared
+  // memory workers borrow a transport context owned by run_benchmark().
+  kj::AutoCloseFd preconnected_fd;
+  ShmBenchmarkTransport* shm_transport = nullptr;
+  std::size_t shm_slot_index = 0;
+};
+
+struct SocketpairWorkers {
+  // Spawn-local pipe://socketpair mode creates one socketpair per worker before
+  // exec so the child inherits the server ends and each benchmark worker keeps
+  // its own parent-side stream.
+  std::vector<kj::AutoCloseFd> client_fds;
+  std::vector<kj::AutoCloseFd> server_fds;
+};
+
+// Spawn-local Unix sockets leave a filesystem entry behind, so the benchmark
+// owns cleanup on both entry and exit to keep manual smoke runs repeatable.
+class UnixSocketPathGuard {
+public:
+  explicit UnixSocketPathGuard(std::filesystem::path path) : path_(std::move(path)) {
+    cleanup();
+  }
+  UnixSocketPathGuard(const UnixSocketPathGuard&) = delete;
+  UnixSocketPathGuard& operator=(const UnixSocketPathGuard&) = delete;
+  UnixSocketPathGuard(UnixSocketPathGuard&&) noexcept = default;
+  UnixSocketPathGuard& operator=(UnixSocketPathGuard&&) noexcept = default;
+
+  ~UnixSocketPathGuard() {
+    cleanup();
+  }
+
+private:
+  void cleanup() const {
+    std::error_code error;
+    std::filesystem::remove(path_, error);
+  }
+
+  std::filesystem::path path_;
+};
+
+// Each worker owns one explicit TwoPartyVatNetwork + RpcSystem stack so every
+// transport, including preconnected streams, flows through the same RPC
+// bootstrap path.
+class ClientRpcSession {
+public:
+  explicit ClientRpcSession(kj::Own<kj::AsyncIoStream>&& connection)
+      : connection_(kj::mv(connection)), network_(*connection_, capnp::rpc::twoparty::Side::CLIENT),
+        rpc_system_(capnp::makeRpcClient(network_)),
+        hash_service_(bootstrap_hash_service(rpc_system_)) {}
+
+  explicit ClientRpcSession(kj::Own<capnp::MessageStream>&& message_stream)
+      : message_stream_(kj::mv(message_stream)),
+        network_(*message_stream_, capnp::rpc::twoparty::Side::CLIENT),
+        rpc_system_(capnp::makeRpcClient(network_)),
+        hash_service_(bootstrap_hash_service(rpc_system_)) {}
+
+  [[nodiscard]] HashService::Client& hash_service() {
+    return hash_service_;
+  }
+
+private:
+  [[nodiscard]] static HashService::Client
+  bootstrap_hash_service(capnp::RpcSystem<capnp::rpc::twoparty::VatId>& rpc_system) {
+    capnp::MallocMessageBuilder vat_id_builder;
+    auto vat_id = vat_id_builder.initRoot<capnp::rpc::twoparty::VatId>();
+    vat_id.setSide(capnp::rpc::twoparty::Side::SERVER);
+    return rpc_system.bootstrap(vat_id).castAs<HashService>();
+  }
+
+  kj::Own<kj::AsyncIoStream> connection_;
+  kj::Own<capnp::MessageStream> message_stream_;
+  capnp::TwoPartyVatNetwork network_;
+  capnp::RpcSystem<capnp::rpc::twoparty::VatId> rpc_system_;
+  HashService::Client hash_service_;
 };
 
 struct PayloadGenerator {
@@ -210,7 +304,8 @@ struct PayloadGenerator {
     return 0;
   }
 
-  const auto rank = static_cast<std::size_t>(std::ceil(percentile * samples.size()));
+  const auto rank =
+      static_cast<std::size_t>(std::ceil(percentile * static_cast<double>(samples.size())));
   const auto index = std::min(samples.size() - 1, std::max<std::size_t>(1, rank) - 1);
   return samples[index];
 }
@@ -257,30 +352,218 @@ spawn_process(const std::filesystem::path& program, const std::vector<std::strin
   return pid;
 }
 
-[[nodiscard]] std::expected<void, std::string>
-wait_for_endpoint_ready(const Endpoint& endpoint, std::chrono::milliseconds timeout) {
-  const auto deadline = Clock::now() + timeout;
-  while (Clock::now() < deadline) {
-    try {
-      auto io_context = kj::setupAsyncIo();
-      auto address = io_context.provider->getNetwork()
-                         .parseAddress(endpoint.host.c_str(), endpoint.port)
-                         .wait(io_context.waitScope);
-      auto connection = address->connect().wait(io_context.waitScope);
-      capnp::TwoPartyClient rpc_client(*connection);
-      auto hash_service = rpc_client.bootstrap().castAs<HashService>();
-      static_cast<void>(
-          send_hash_request(hash_service, std::span<const std::byte>{}, io_context.waitScope));
-      return {};
-    } catch (const kj::Exception&) {
-    } catch (const std::exception&) {
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+[[nodiscard]] std::expected<void, std::string> set_fd_inheritable(int fd, bool inheritable) {
+  const int current_flags = ::fcntl(fd, F_GETFD);
+  if (current_flags < 0) {
+    return std::unexpected(std::format("fcntl(F_GETFD) failed for fd {}", fd));
   }
 
-  return std::unexpected(std::format("endpoint did not become ready: {}", endpoint.to_string()));
+  const int next_flags = inheritable ? (current_flags & ~FD_CLOEXEC) : (current_flags | FD_CLOEXEC);
+  if (::fcntl(fd, F_SETFD, next_flags) < 0) {
+    return std::unexpected(std::format("fcntl(F_SETFD) failed for fd {}", fd));
+  }
+  return {};
 }
+
+[[nodiscard]] std::expected<ReadyPipe, std::string> create_ready_pipe() {
+  int fds[2] = {-1, -1};
+  if (::pipe(fds) != 0) {
+    return std::unexpected("pipe() failed while creating the spawn-local ready pipe");
+  }
+
+  ReadyPipe pipe{
+      .read_end = kj::AutoCloseFd(fds[0]),
+      .write_end = kj::AutoCloseFd(fds[1]),
+  };
+  if (auto cloexec = set_fd_inheritable(pipe.read_end.get(), false); !cloexec) {
+    return std::unexpected(cloexec.error());
+  }
+  if (auto cloexec = set_fd_inheritable(pipe.write_end.get(), false); !cloexec) {
+    return std::unexpected(cloexec.error());
+  }
+  if (auto inheritable = set_fd_inheritable(pipe.write_end.get(), true); !inheritable) {
+    return std::unexpected(inheritable.error());
+  }
+  return pipe;
+}
+
+[[nodiscard]] std::expected<void, std::string>
+wait_for_ready_pipe(int fd, std::chrono::milliseconds timeout) {
+  pollfd descriptor{
+      .fd = fd,
+      .events = POLLIN,
+      .revents = 0,
+  };
+  const int poll_result = ::poll(&descriptor, 1, static_cast<int>(timeout.count()));
+  if (poll_result < 0) {
+    return std::unexpected("poll() failed while waiting for the spawn-local ready pipe");
+  }
+  if (poll_result == 0) {
+    return std::unexpected("spawn-local server did not report readiness before the timeout");
+  }
+
+  std::byte ready{};
+  const auto bytes_read = ::read(fd, &ready, 1);
+  if (bytes_read == 1) {
+    return {};
+  }
+  if (bytes_read == 0) {
+    return std::unexpected("spawn-local server exited before reporting readiness");
+  }
+  return std::unexpected("read() failed while waiting for the spawn-local ready pipe");
+}
+
+[[nodiscard]] std::expected<SocketpairWorkers, std::string>
+create_socketpair_workers(std::size_t count) {
+  SocketpairWorkers workers;
+  workers.client_fds.reserve(count);
+  workers.server_fds.reserve(count);
+
+  for (std::size_t index = 0; index < count; ++index) {
+    int fds[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+      return std::unexpected("socketpair() failed while preparing pipe://socketpair workers");
+    }
+
+    kj::AutoCloseFd client_end(fds[0]);
+    kj::AutoCloseFd server_end(fds[1]);
+    if (auto cloexec = set_fd_inheritable(client_end.get(), false); !cloexec) {
+      return std::unexpected(cloexec.error());
+    }
+    if (auto cloexec = set_fd_inheritable(server_end.get(), false); !cloexec) {
+      return std::unexpected(cloexec.error());
+    }
+    if (auto inheritable = set_fd_inheritable(server_end.get(), true); !inheritable) {
+      return std::unexpected(inheritable.error());
+    }
+
+    workers.server_fds.emplace_back(kj::mv(server_end));
+    workers.client_fds.emplace_back(kj::mv(client_end));
+  }
+
+  return workers;
+}
+
+[[nodiscard]] kj::Own<kj::AsyncIoStream> connect_network_stream(const TransportUri& uri,
+                                                                kj::AsyncIoContext& io_context) {
+  auto address_text = uri.to_kj_address();
+  if (!address_text) {
+    KJ_FAIL_REQUIRE("invalid KJ network address", address_text.error().c_str());
+  }
+  auto address = io_context.provider->getNetwork()
+                     .parseAddress(address_text->c_str())
+                     .wait(io_context.waitScope);
+  return address->connect().wait(io_context.waitScope);
+}
+
+[[nodiscard]] std::expected<std::pair<kj::AutoCloseFd, kj::AutoCloseFd>, std::string>
+create_control_socketpair() {
+  int fds[2] = {-1, -1};
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+    return std::unexpected("socketpair() failed while preparing the shared-memory control socket");
+  }
+
+  kj::AutoCloseFd parent_end(fds[0]);
+  kj::AutoCloseFd child_end(fds[1]);
+  if (auto cloexec = set_fd_inheritable(parent_end.get(), false); !cloexec) {
+    return std::unexpected(cloexec.error());
+  }
+  if (auto cloexec = set_fd_inheritable(child_end.get(), false); !cloexec) {
+    return std::unexpected(cloexec.error());
+  }
+  if (auto inheritable = set_fd_inheritable(child_end.get(), true); !inheritable) {
+    return std::unexpected(inheritable.error());
+  }
+  return std::make_pair(kj::mv(parent_end), kj::mv(child_end));
+}
+
+inline constexpr std::size_t kShmRingCapacity = 8;
+inline constexpr std::size_t kShmMaxMessageBytes =
+    static_cast<std::size_t>(kMaxPayloadSizeBytes) + (static_cast<std::size_t>(64U) * 1024U);
+
+// The benchmark owns one shared-memory region and one parent-side wake broker
+// for all shm://NAME workers. The worker threads borrow slot-local views from
+// this context while it keeps the mapped region and broker alive for the whole
+// run.
+class ShmBenchmarkTransport {
+public:
+  [[nodiscard]] static std::expected<std::unique_ptr<ShmBenchmarkTransport>, std::string>
+  create(std::string_view logical_name, std::size_t slot_count, kj::AutoCloseFd control_fd) {
+    auto region = ShmTransportRegion::create(logical_name,
+                                             ShmTransportOptions{
+                                                 .slot_count = slot_count,
+                                                 .request_ring_capacity = kShmRingCapacity,
+                                                 .response_ring_capacity = kShmRingCapacity,
+                                                 .request_max_message_bytes = kShmMaxMessageBytes,
+                                                 .response_max_message_bytes = kShmMaxMessageBytes,
+                                             });
+    if (!region) {
+      return std::unexpected(region.error());
+    }
+
+    auto transport =
+        std::unique_ptr<ShmBenchmarkTransport>(new ShmBenchmarkTransport(kj::mv(*region)));
+    transport->wake_listeners_.reserve(slot_count);
+    transport->wake_listener_ptrs_.reserve(slot_count);
+    for (std::size_t slot_index = 0; slot_index < slot_count; ++slot_index) {
+      transport->wake_listeners_.push_back(std::make_unique<CrossThreadWakeListener>());
+      transport->wake_listener_ptrs_.push_back(transport->wake_listeners_.back().get());
+    }
+
+    transport->broker_ = std::make_unique<ParentWakeBroker>(
+        control_fd.release(), std::span<CrossThreadWakeListener*>(transport->wake_listener_ptrs_));
+    if (auto started = transport->broker_->start(); !started) {
+      return std::unexpected(started.error());
+    }
+
+    return transport;
+  }
+
+  ShmBenchmarkTransport(const ShmBenchmarkTransport&) = delete;
+  ShmBenchmarkTransport& operator=(const ShmBenchmarkTransport&) = delete;
+  ShmBenchmarkTransport(ShmBenchmarkTransport&&) = delete;
+  ShmBenchmarkTransport& operator=(ShmBenchmarkTransport&&) = delete;
+  ~ShmBenchmarkTransport() {
+    [[maybe_unused]] const auto cleanup = region_.unlink();
+    if (broker_) {
+      broker_->stop();
+    }
+  }
+
+  [[nodiscard]] kj::Own<capnp::MessageStream> make_message_stream(std::size_t slot_index) {
+    KJ_REQUIRE(broker_ != nullptr, "shared-memory benchmark transport is missing its wake broker");
+    return kj::heap<ShmMessageStream>(slot_index,
+                                      region_.benchmark_endpoint(slot_index),
+                                      *wake_listeners_.at(slot_index),
+                                      *broker_);
+  }
+
+  [[nodiscard]] std::expected<void, std::string> send_init_messages() {
+    KJ_REQUIRE(broker_ != nullptr, "shared-memory benchmark transport is missing its wake broker");
+    for (std::size_t slot_index = 0; slot_index < wake_listeners_.size(); ++slot_index) {
+      if (auto sent = broker_->send_init(slot_index); !sent) {
+        return std::unexpected(sent.error());
+      }
+    }
+    return {};
+  }
+
+  [[nodiscard]] std::expected<void, std::string> unlink_region() const {
+    return region_.unlink();
+  }
+
+  [[nodiscard]] std::optional<std::string> background_error() const {
+    return broker_ ? broker_->background_error() : std::nullopt;
+  }
+
+private:
+  explicit ShmBenchmarkTransport(ShmTransportRegion&& region) : region_(kj::mv(region)) {}
+
+  ShmTransportRegion region_;
+  std::vector<std::unique_ptr<CrossThreadWakeListener>> wake_listeners_;
+  std::vector<CrossThreadWakeListener*> wake_listener_ptrs_;
+  std::unique_ptr<ParentWakeBroker> broker_;
+};
 
 void run_phase(HashService::Client& hash_service,
                PayloadGenerator& generator,
@@ -312,8 +595,9 @@ void run_phase(HashService::Client& hash_service,
   }
 }
 
-[[nodiscard]] ThreadResult run_client_thread(const Endpoint& endpoint,
+[[nodiscard]] ThreadResult run_client_thread(const TransportUri& uri,
                                              const BenchConfig& config,
+                                             WorkerTransport transport,
                                              std::size_t thread_index,
                                              std::barrier<>& warmup_barrier,
                                              std::barrier<>& measure_barrier) {
@@ -322,22 +606,36 @@ void run_phase(HashService::Client& hash_service,
 
   try {
     auto io_context = kj::setupAsyncIo();
-    auto address = io_context.provider->getNetwork()
-                       .parseAddress(endpoint.host.c_str(), endpoint.port)
-                       .wait(io_context.waitScope);
-    auto connection = address->connect().wait(io_context.waitScope);
-    capnp::TwoPartyClient rpc_client(*connection);
-    auto hash_service = rpc_client.bootstrap().castAs<HashService>();
+    std::optional<ClientRpcSession> rpc_session;
+    if (transport.shm_transport != nullptr) {
+      rpc_session.emplace(transport.shm_transport->make_message_stream(transport.shm_slot_index));
+    } else {
+      kj::Own<kj::AsyncIoStream> connection;
+      if (transport.preconnected_fd != nullptr) {
+        connection = io_context.lowLevelProvider->wrapSocketFd(kj::mv(transport.preconnected_fd));
+      } else {
+        connection = connect_network_stream(uri, io_context);
+      }
+      rpc_session.emplace(kj::mv(connection));
+    }
 
     PayloadGenerator generator(thread_index, config.message_sizes, config.seed);
     warmup_barrier.arrive_and_wait();
     joined_warmup = true;
-    run_phase(hash_service, generator, config.warmup_seconds, nullptr, io_context.waitScope);
+    run_phase(rpc_session->hash_service(),
+              generator,
+              config.warmup_seconds,
+              nullptr,
+              io_context.waitScope);
 
     measure_barrier.arrive_and_wait();
     joined_measure = true;
     ThreadResult result;
-    run_phase(hash_service, generator, config.measure_seconds, &result.stats, io_context.waitScope);
+    run_phase(rpc_session->hash_service(),
+              generator,
+              config.measure_seconds,
+              &result.stats,
+              io_context.waitScope);
     return result;
   } catch (const kj::Exception& exception) {
     if (!joined_warmup) {
@@ -402,14 +700,15 @@ std::expected<void, std::string> BenchConfig::validate() const {
 
   switch (mode) {
   case BenchMode::connect:
-    if (endpoint.host.empty() || endpoint.port == 0) {
-      return std::unexpected("connect mode requires --endpoint=HOST:PORT");
+    if (!connect_uri) {
+      return std::unexpected("connect mode requires --connect-uri=URI");
+    }
+    if (connect_uri->kind == TransportKind::pipe_socketpair ||
+        connect_uri->kind == TransportKind::shared_memory) {
+      return std::unexpected("connect mode only supports tcp://... and unix://...");
     }
     break;
   case BenchMode::spawn_local:
-    if (listen_host.empty()) {
-      return std::unexpected("listen host must not be empty");
-    }
     if (server_binary.empty()) {
       return std::unexpected("spawn-local mode requires a server binary path");
     }
@@ -419,14 +718,11 @@ std::expected<void, std::string> BenchConfig::validate() const {
   return {};
 }
 
-Endpoint BenchConfig::resolved_endpoint() const {
+TransportUri BenchConfig::resolved_uri() const {
   if (mode == BenchMode::connect) {
-    return endpoint;
+    return connect_uri.value_or(listen_uri);
   }
-  return Endpoint{
-      .host = listen_host,
-      .port = server_port,
-  };
+  return listen_uri;
 }
 
 std::string BenchmarkResult::to_text() const {
@@ -523,12 +819,12 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
       continue;
     }
 
-    if (const auto value = get_value(arg, "--endpoint=")) {
-      auto parsed = parse_endpoint(*value);
+    if (const auto value = get_value(arg, "--connect-uri=")) {
+      auto parsed = parse_transport_uri(*value);
       if (!parsed) {
         return std::unexpected(parsed.error());
       }
-      config.endpoint = *parsed;
+      config.connect_uri = *parsed;
       continue;
     }
 
@@ -537,17 +833,12 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
       continue;
     }
 
-    if (const auto value = get_value(arg, "--listen-host=")) {
-      config.listen_host = std::string(*value);
-      continue;
-    }
-
-    if (const auto value = get_value(arg, "--server-port=")) {
-      auto parsed = parse_port(*value, "server port");
+    if (const auto value = get_value(arg, "--listen-uri=")) {
+      auto parsed = parse_transport_uri(*value);
       if (!parsed) {
         return std::unexpected(parsed.error());
       }
-      config.server_port = *parsed;
+      config.listen_uri = *parsed;
       continue;
     }
 
@@ -630,36 +921,92 @@ std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::
 }
 
 std::string bench_usage(std::string_view program_name) {
-  return std::format("Usage: {} [options]\n"
-                     "\n"
-                     "Options:\n"
-                     "  --mode=connect|spawn-local   Run mode. Default: spawn-local\n"
-                     "  --endpoint=HOST:PORT         Target endpoint for connect mode\n"
-                     "  --server-binary=PATH         Server binary for spawn-local mode\n"
-                     "  --listen-host=HOST           Spawn-local bind host. Default: 127.0.0.1\n"
-                     "  --server-port=PORT           Spawn-local port. Default: 7300\n"
-                     "  --client-threads=N           Client thread count. Default: 1\n"
-                     "  --message-size-min=N         Inclusive minimum payload size. Default: 128\n"
-                     "  --message-size-max=N         Inclusive maximum payload size. Default: 256\n"
-                     "  --warmup-seconds=SECONDS     Warmup duration. Default: 1.0\n"
-                     "  --measure-seconds=SECONDS    Measured duration. Default: 3.0\n"
-                     "  --seed=N                     Deterministic payload seed. Default: 1\n"
-                     "  --startup-timeout-ms=N       Spawn-local startup timeout. Default: 5000\n"
-                     "  --json-output=PATH           Optional JSON report path\n"
-                     "  --quiet-server               Suppress the child server banner\n"
-                     "  --help                       Show this message\n",
-                     program_name);
+  return std::format(
+      "Usage: {} [options]\n"
+      "\n"
+      "Options:\n"
+      "  --mode=connect|spawn-local Run mode. Default: spawn-local\n"
+      "  --connect-uri=URI         Target URI for connect mode\n"
+      "  --server-binary=PATH      Server binary for spawn-local mode\n"
+      "  --listen-uri=URI          Spawn-local listen URI. Default: tcp://127.0.0.1:7300\n"
+      "  --client-threads=N        Client thread count. Default: 1\n"
+      "  --message-size-min=N      Inclusive minimum payload size. Default: 128\n"
+      "  --message-size-max=N      Inclusive maximum payload size. Default: 256\n"
+      "  --warmup-seconds=SECONDS  Warmup duration. Default: 1.0\n"
+      "  --measure-seconds=SECONDS Measured duration. Default: 3.0\n"
+      "  --seed=N                  Deterministic payload seed. Default: 1\n"
+      "  --startup-timeout-ms=N    Spawn-local startup timeout. Default: 5000\n"
+      "  --json-output=PATH        Optional JSON report path\n"
+      "  --quiet-server            Suppress the child server banner\n"
+      "  --help                    Show this message\n",
+      program_name);
 }
 
 std::expected<BenchmarkResult, std::string> run_benchmark(const BenchConfig& config) {
+  std::unique_ptr<ShmBenchmarkTransport> shm_transport;
   SpawnedProcess spawned_server;
+  std::vector<WorkerTransport> worker_transports(config.client_threads);
+  std::optional<UnixSocketPathGuard> unix_socket_guard;
   if (config.mode == BenchMode::spawn_local) {
+    auto ready_pipe = create_ready_pipe();
+    if (!ready_pipe) {
+      return std::unexpected(ready_pipe.error());
+    }
+
     std::vector<std::string> args{
-        std::format("--listen-host={}", config.listen_host),
-        std::format("--port={}", config.server_port),
+        std::format("--listen-uri={}", config.listen_uri.to_string()),
+        std::format("--internal-ready-fd={}", ready_pipe->write_end.get()),
     };
     if (config.quiet_server) {
       args.emplace_back("--quiet");
+    }
+
+    std::optional<SocketpairWorkers> socketpair_workers;
+    std::optional<std::pair<kj::AutoCloseFd, kj::AutoCloseFd>> shm_control_socketpair;
+    switch (config.listen_uri.kind) {
+    case TransportKind::tcp:
+      break;
+    case TransportKind::unix_socket:
+      unix_socket_guard.emplace(config.listen_uri.location);
+      break;
+    case TransportKind::pipe_socketpair: {
+      auto workers = create_socketpair_workers(config.client_threads);
+      if (!workers) {
+        return std::unexpected(workers.error());
+      }
+      socketpair_workers = std::move(*workers);
+
+      std::string joined;
+      for (std::size_t index = 0; index < socketpair_workers->server_fds.size(); ++index) {
+        if (index > 0) {
+          joined.push_back(',');
+        }
+        joined += std::to_string(socketpair_workers->server_fds[index].get());
+      }
+      args.push_back(std::format("--internal-preconnected-fds={}", joined));
+      break;
+    }
+    case TransportKind::shared_memory: {
+      auto control_socketpair = create_control_socketpair();
+      if (!control_socketpair) {
+        return std::unexpected(control_socketpair.error());
+      }
+      shm_control_socketpair = std::move(*control_socketpair);
+
+      auto created_transport = ShmBenchmarkTransport::create(
+          config.listen_uri.location, config.client_threads, kj::mv(shm_control_socketpair->first));
+      if (!created_transport) {
+        return std::unexpected(created_transport.error());
+      }
+      shm_transport = std::move(*created_transport);
+
+      args.push_back(
+          std::format("--internal-shm-control-fd={}", shm_control_socketpair->second.get()));
+      args.push_back(std::format("--internal-shm-slot-count={}", config.client_threads));
+      break;
+    }
+    case TransportKind::unspecified:
+      return std::unexpected("listen URI is not configured");
     }
 
     auto pid = spawn_process(std::filesystem::absolute(config.server_binary), args);
@@ -667,15 +1014,36 @@ std::expected<BenchmarkResult, std::string> run_benchmark(const BenchConfig& con
       return std::unexpected(pid.error());
     }
     spawned_server.pid = *pid;
+    ready_pipe->write_end = nullptr;
 
-    auto ready = wait_for_endpoint_ready(config.resolved_endpoint(),
-                                         std::chrono::milliseconds(config.startup_timeout_ms));
+    if (socketpair_workers) {
+      for (std::size_t index = 0; index < config.client_threads; ++index) {
+        worker_transports[index].preconnected_fd = kj::mv(socketpair_workers->client_fds[index]);
+      }
+    }
+    if (shm_transport) {
+      if (auto sent = shm_transport->send_init_messages(); !sent) {
+        return std::unexpected(sent.error());
+      }
+    }
+
+    auto ready = wait_for_ready_pipe(ready_pipe->read_end.get(),
+                                     std::chrono::milliseconds(config.startup_timeout_ms));
     if (!ready) {
       return std::unexpected(ready.error());
     }
+    if (shm_transport) {
+      if (auto unlinked = shm_transport->unlink_region(); !unlinked) {
+        return std::unexpected(unlinked.error());
+      }
+      for (std::size_t index = 0; index < config.client_threads; ++index) {
+        worker_transports[index].shm_transport = shm_transport.get();
+        worker_transports[index].shm_slot_index = index;
+      }
+    }
   }
 
-  const auto endpoint = config.resolved_endpoint();
+  const auto uri = config.resolved_uri();
   std::barrier<> warmup_barrier(static_cast<std::ptrdiff_t>(config.client_threads + 1));
   std::barrier<> measure_barrier(static_cast<std::ptrdiff_t>(config.client_threads + 1));
 
@@ -684,8 +1052,9 @@ std::expected<BenchmarkResult, std::string> run_benchmark(const BenchConfig& con
   threads.reserve(config.client_threads);
 
   for (std::size_t index = 0; index < config.client_threads; ++index) {
-    threads.emplace_back([&, index] {
-      results[index] = run_client_thread(endpoint, config, index, warmup_barrier, measure_barrier);
+    threads.emplace_back([&, index, transport = kj::mv(worker_transports[index])]() mutable {
+      results[index] =
+          run_client_thread(uri, config, kj::mv(transport), index, warmup_barrier, measure_barrier);
     });
   }
 
@@ -698,7 +1067,7 @@ std::expected<BenchmarkResult, std::string> run_benchmark(const BenchConfig& con
 
   BenchmarkResult result{
       .mode = config.mode,
-      .endpoint = endpoint.to_string(),
+      .endpoint = uri.to_string(),
       .client_threads = config.client_threads,
       .message_sizes = config.message_sizes,
       .latency = {},
@@ -726,6 +1095,12 @@ std::expected<BenchmarkResult, std::string> run_benchmark(const BenchConfig& con
         std::format("benchmark failed with {} client thread error(s); first error: {}",
                     result.errors,
                     *first_error));
+  }
+  if (shm_transport) {
+    if (const auto background_error = shm_transport->background_error(); background_error) {
+      return std::unexpected(
+          std::format("shared-memory wake broker failed: {}", *background_error));
+    }
   }
 
   result.latency = compute_percentiles(std::move(latencies));

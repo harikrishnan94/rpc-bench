@@ -1,5 +1,5 @@
-// Shared protocol-side parsing and endpoint utilities. These helpers keep the
-// server and benchmark frontends aligned on mode names, endpoint syntax, and
+// Shared protocol-side parsing and transport-URI utilities. These helpers keep
+// the server and benchmark frontends aligned on mode names, URI syntax, and
 // the hard payload-size contract.
 
 #include "protocol/common.hpp"
@@ -9,12 +9,90 @@
 #include <limits>
 
 namespace rpcbench {
+namespace {
 
-std::string Endpoint::to_string() const {
+[[nodiscard]] std::string format_host_port(std::string_view host, std::uint16_t port) {
   if (host.find(':') != std::string::npos && !host.starts_with('[')) {
     return std::format("[{}]:{}", host, port);
   }
   return std::format("{}:{}", host, port);
+}
+
+[[nodiscard]] std::expected<TransportUri, std::string> parse_tcp_uri_body(std::string_view text) {
+  if (text.empty()) {
+    return std::unexpected("tcp URI must include HOST:PORT");
+  }
+
+  if (text.starts_with('[')) {
+    const auto close = text.rfind(']');
+    if (close == std::string_view::npos || close + 2 >= text.size() || text[close + 1] != ':') {
+      return std::unexpected(std::format("invalid tcp URI '{}'", text));
+    }
+
+    auto port = parse_port(text.substr(close + 2), "tcp port");
+    if (!port) {
+      return std::unexpected(port.error());
+    }
+
+    return TransportUri{
+        .kind = TransportKind::tcp,
+        .location = std::string(text.substr(1, close - 1)),
+        .port = *port,
+    };
+  }
+
+  const auto colon = text.rfind(':');
+  if (colon == std::string_view::npos || colon == 0 || colon + 1 >= text.size()) {
+    return std::unexpected(std::format("invalid tcp URI '{}'", text));
+  }
+
+  auto port = parse_port(text.substr(colon + 1), "tcp port");
+  if (!port) {
+    return std::unexpected(port.error());
+  }
+
+  return TransportUri{
+      .kind = TransportKind::tcp,
+      .location = std::string(text.substr(0, colon)),
+      .port = *port,
+  };
+}
+
+} // namespace
+
+std::string TransportUri::to_string() const {
+  switch (kind) {
+  case TransportKind::unspecified:
+    return {};
+  case TransportKind::tcp:
+    return std::format("tcp://{}", format_host_port(location, port));
+  case TransportKind::unix_socket:
+    return std::format("unix://{}", location);
+  case TransportKind::pipe_socketpair:
+    return "pipe://socketpair";
+  case TransportKind::shared_memory:
+    return std::format("shm://{}", location);
+  }
+  return {};
+}
+
+std::expected<std::string, std::string> TransportUri::to_kj_address() const {
+  switch (kind) {
+  case TransportKind::tcp:
+    return format_host_port(location, port);
+  case TransportKind::unix_socket:
+    return std::format("unix:{}", location);
+  case TransportKind::unspecified:
+    return std::unexpected("transport URI is not configured");
+  case TransportKind::pipe_socketpair:
+  case TransportKind::shared_memory:
+    return std::unexpected(std::format("{} does not use KJ NetworkAddress", to_string()));
+  }
+  return std::unexpected("unsupported transport kind");
+}
+
+bool TransportUri::uses_kj_network() const {
+  return kind == TransportKind::tcp || kind == TransportKind::unix_socket;
 }
 
 std::expected<void, std::string> MessageSizeRange::validate() const {
@@ -64,42 +142,56 @@ std::expected<BenchMode, std::string> parse_bench_mode(std::string_view text) {
   return std::unexpected(std::format("invalid benchmark mode: '{}'", text));
 }
 
-std::expected<Endpoint, std::string> parse_endpoint(std::string_view text) {
+std::expected<TransportUri, std::string> parse_transport_uri(std::string_view text) {
   if (text.empty()) {
-    return std::unexpected("endpoint must not be empty");
+    return std::unexpected("transport URI must not be empty");
   }
 
-  if (text.starts_with('[')) {
-    const auto close = text.rfind(']');
-    if (close == std::string_view::npos || close + 2 >= text.size() || text[close + 1] != ':') {
-      return std::unexpected(std::format("invalid endpoint '{}'", text));
-    }
+  constexpr std::string_view kTcpPrefix = "tcp://";
+  constexpr std::string_view kUnixPrefix = "unix://";
+  constexpr std::string_view kPipePrefix = "pipe://";
+  constexpr std::string_view kShmPrefix = "shm://";
 
-    auto port = parse_port(text.substr(close + 2), "endpoint port");
-    if (!port) {
-      return std::unexpected(port.error());
-    }
+  if (text.starts_with(kTcpPrefix)) {
+    return parse_tcp_uri_body(text.substr(kTcpPrefix.size()));
+  }
 
-    return Endpoint{
-        .host = std::string(text.substr(1, close - 1)),
-        .port = *port,
+  if (text.starts_with(kUnixPrefix)) {
+    const auto path = text.substr(kUnixPrefix.size());
+    if (path.empty() || !path.starts_with('/')) {
+      return std::unexpected("unix URI must use an absolute path like unix:///tmp/rpc-bench.sock");
+    }
+    return TransportUri{
+        .kind = TransportKind::unix_socket,
+        .location = std::string(path),
     };
   }
 
-  const auto colon = text.rfind(':');
-  if (colon == std::string_view::npos || colon == 0 || colon + 1 >= text.size()) {
-    return std::unexpected(std::format("invalid endpoint '{}'", text));
+  if (text.starts_with(kPipePrefix)) {
+    if (text.substr(kPipePrefix.size()) != "socketpair") {
+      return std::unexpected("the only supported pipe URI is pipe://socketpair");
+    }
+    return TransportUri{
+        .kind = TransportKind::pipe_socketpair,
+        .location = "socketpair",
+    };
   }
 
-  auto port = parse_port(text.substr(colon + 1), "endpoint port");
-  if (!port) {
-    return std::unexpected(port.error());
+  if (text.starts_with(kShmPrefix)) {
+    const auto name = text.substr(kShmPrefix.size());
+    if (name.empty()) {
+      return std::unexpected("shared-memory URI must include a name like shm://bench");
+    }
+    if (name.find('/') != std::string_view::npos) {
+      return std::unexpected("shared-memory URI names must not contain '/'");
+    }
+    return TransportUri{
+        .kind = TransportKind::shared_memory,
+        .location = std::string(name),
+    };
   }
 
-  return Endpoint{
-      .host = std::string(text.substr(0, colon)),
-      .port = *port,
-  };
+  return std::unexpected("transport URI must start with tcp://, unix://, pipe://, or shm://");
 }
 
 std::filesystem::path sibling_binary_path(const std::filesystem::path& argv0,

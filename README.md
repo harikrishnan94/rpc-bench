@@ -7,14 +7,13 @@ repository builds:
 - `rpc-bench-server`
 - `rpc-bench-bench`
 
-The current implementation keeps the existing CLI, lifecycle, and report shape
-while moving the transport from raw framed TCP to Cap'n Proto RPC on top of
-KJ async I/O.
+The current implementation keeps one Cap'n Proto RPC contract and one KJ event
+loop on the server for every transport.
 
 ## System Prerequisites
 
-`rpc-bench` depends on a system-installed Cap'n Proto toolchain. Meson will
-look for:
+`rpc-bench` depends on a system-installed Cap'n Proto toolchain. Meson looks
+for:
 
 - `capnp` on `PATH`
 - `capnpc-c++` on `PATH`
@@ -26,9 +25,8 @@ Common installation routes:
 - `apt-get install capnproto`
 - `pacman -S capnproto`
 
-If Cap'n Proto is already installed but Meson cannot find it, expose the
-compiler tools through `PATH` and the pkg-config metadata through
-`PKG_CONFIG_PATH`.
+If Cap'n Proto is already installed but Meson cannot find it, expose the tools
+through `PATH` and the pkg-config metadata through `PKG_CONFIG_PATH`.
 
 ## Build
 
@@ -38,10 +36,6 @@ Use the repository's local Meson native files. The default debug workflow is:
 meson setup builddir --native-file native/clang22-debug.ini
 meson compile -C builddir
 ```
-
-This repository ships no dependency-acquisition metadata or Meson subproject
-fallback for third-party libraries. Configuration stops with a friendly hint if
-the system toolchain is missing.
 
 ## Service Contract
 
@@ -59,34 +53,61 @@ Behavior:
 Oversized direct RPC calls fail as application/RPC errors rather than being
 silently truncated.
 
+## URI Surface
+
+The public CLI is URI-first.
+
+Supported listen or connect URIs:
+
+- `tcp://HOST:PORT`
+- `unix:///absolute/path`
+- `pipe://socketpair`
+- `shm://NAME`
+
+Transport restrictions:
+
+- `connect` supports `tcp://...` and `unix://...`
+- `spawn-local` supports all four URI kinds
+- `pipe://socketpair` and `shm://NAME` are local-only spawn-local transports
+
 ## `rpc-bench-server`
 
-The server owns one KJ event loop, listens on one endpoint, and serves the
-hashing capability over Cap'n Proto's two-party RPC transport.
+The server owns one KJ event loop for every transport and serves one bootstrap
+capability over Cap'n Proto two-party RPC.
 
 Example:
 
 ```sh
 ./builddir/src/server/rpc-bench-server \
-  --listen-host=127.0.0.1 \
-  --port=7000
+  --listen-uri=tcp://127.0.0.1:7000
 ```
+
+Unix-domain example:
+
+```sh
+./builddir/src/server/rpc-bench-server \
+  --listen-uri=unix:///tmp/rpc-bench.sock
+```
+
+`pipe://socketpair` and `shm://NAME` are intended for `spawn-local` mode, where
+the benchmark process supplies the inherited descriptors and shared-memory setup
+for the child server automatically.
 
 Use `--quiet` to suppress the startup banner while keeping warnings and errors
 on `stderr`.
 
 ## `rpc-bench-bench`
 
-The benchmark keeps the existing two modes:
+The benchmark keeps the two existing run modes:
 
 - `spawn-local`: launch one local `rpc-bench-server` child process
-- `connect`: benchmark one already running endpoint
+- `connect`: benchmark one already running server
 
 Each benchmark run uses:
 
-- one OS thread per connection
-- one RPC connection per thread
-- one outstanding request per connection
+- one OS thread per logical worker
+- one RPC session per worker
+- one outstanding request per worker
 - one warmup phase and one measured phase
 - per-request payload sizes sampled uniformly from an inclusive range
 
@@ -95,8 +116,7 @@ Example `spawn-local` run:
 ```sh
 ./builddir/src/bench/rpc-bench-bench \
   --mode=spawn-local \
-  --listen-host=127.0.0.1 \
-  --server-port=7300 \
+  --listen-uri=tcp://127.0.0.1:7300 \
   --client-threads=4 \
   --message-size-min=128 \
   --message-size-max=256 \
@@ -112,7 +132,7 @@ Example `connect` run:
 ```sh
 ./builddir/src/bench/rpc-bench-bench \
   --mode=connect \
-  --endpoint=127.0.0.1:7000 \
+  --connect-uri=tcp://127.0.0.1:7000 \
   --client-threads=4 \
   --message-size-min=128 \
   --message-size-max=256 \
@@ -121,8 +141,24 @@ Example `connect` run:
   --seed=1
 ```
 
+Local transport examples:
+
+- `--listen-uri=unix:///tmp/rpc-bench.sock`
+- `--listen-uri=pipe://socketpair`
+- `--listen-uri=shm://bench`
+
 The default request-size range is `128-256` bytes when no size flags are
 provided.
+
+## Hybrid Shared Memory Transport
+
+`shm://NAME` is a hybrid transport:
+
+- request and response message bytes move through shared-memory rings
+- each worker gets one logical slot
+- a control socket carries init and wake notifications
+- the server side stays on the KJ loop through that control socket instead of a
+  separate polling loop
 
 ## Reporting
 
@@ -149,6 +185,13 @@ These are compatibility-oriented metrics, not literal Cap'n Proto wire bytes.
 
 ## Verification Scope
 
-This milestone does not keep repo-managed automated tests or a coverage target.
-Verification is limited to configuring and building the project plus manual
-`spawn-local` and `connect` smoke runs.
+This milestone keeps verification manual and Meson-based:
+
+- `meson compile -C builddir`
+- one `spawn-local` and one `connect` smoke run for `tcp://...`
+- one `spawn-local` and one `connect` smoke run for `unix://...`
+- one `spawn-local` smoke run for `pipe://socketpair`
+- one `spawn-local` smoke run for `shm://NAME`
+
+This repository does not keep repo-managed automated tests or a coverage target
+in this milestone.

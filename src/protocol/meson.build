@@ -23,6 +23,7 @@ rpcbench_protocol = static_library(
   files(
     'common.cpp',
     'crc32.cpp',
+    'shm_transport.cpp',
   ),
   rpcbench_schema,
   include_directories : [rpcbench_protocol_inc],
