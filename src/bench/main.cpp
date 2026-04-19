@@ -4,6 +4,8 @@
 
 #include <exception>
 #include <fstream>
+#include <kj/exception.h>
+#include <kj/string.h>
 #include <print>
 #include <span>
 #include <string_view>
@@ -48,6 +50,9 @@ int main(int argc, char** argv) {
     }
 
     return 0;
+  } catch (const kj::Exception& exception) {
+    std::println(stderr, "error: {}", kj::str(exception).cStr());
+    return 1;
   } catch (const std::exception& exception) {
     std::println(stderr, "error: {}", exception.what());
     return 1;

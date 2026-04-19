@@ -1,16 +1,34 @@
 # rpc-bench
 
-`rpc-bench` is a clean-slate TCP benchmark for a CRC32 hashing service. The
+`rpc-bench` is a clean-slate benchmark for a CRC32 hashing service. The
 repository builds:
 
-- an internal-only `protocol` library
+- an internal-only protocol/schema library
 - `rpc-bench-server`
 - `rpc-bench-bench`
 
-Clients send arbitrary byte payloads to the server. The server replies with the
-CRC32 hash of each payload as one fixed 32-bit value. The benchmark focuses on
-single-endpoint runs, single-threaded async server execution, and one
-connection-owning client thread per benchmark thread.
+The current implementation keeps the existing CLI, lifecycle, and report shape
+while moving the transport from raw framed TCP to Cap'n Proto RPC on top of
+KJ async I/O.
+
+## System Prerequisites
+
+`rpc-bench` depends on a system-installed Cap'n Proto toolchain. Meson will
+look for:
+
+- `capnp` on `PATH`
+- `capnpc-c++` on `PATH`
+- pkg-config-visible `capnp`, `capnp-rpc`, `kj`, and `kj-async`
+
+Common installation routes:
+
+- `brew install capnp`
+- `apt-get install capnproto`
+- `pacman -S capnproto`
+
+If Cap'n Proto is already installed but Meson cannot find it, expose the
+compiler tools through `PATH` and the pkg-config metadata through
+`PKG_CONFIG_PATH`.
 
 ## Build
 
@@ -21,25 +39,30 @@ meson setup builddir --native-file native/clang22-debug.ini
 meson compile -C builddir
 ```
 
-The first configure downloads standalone Asio from WrapDB. The retained
-`subprojects/capnproto.wrap` file stays in the tree, but this benchmark does
-not use Cap'n Proto in this version.
+This repository ships no dependency-acquisition metadata or Meson subproject
+fallback for third-party libraries. Configuration stops with a friendly hint if
+the system toolchain is missing.
 
-## Protocol
+## Service Contract
 
-The wire protocol is raw framed TCP:
+The service exposes one unary Cap'n Proto RPC:
 
-- request: 4-byte big-endian payload length followed by payload bytes
-- response: 4-byte big-endian CRC32 value
-- maximum request payload: 1 MiB
+- `hash(payload :Data) -> (crc32 :UInt32)`
 
-If a client advertises a payload larger than 1 MiB, the server closes the
-connection instead of attempting the read.
+Behavior:
+
+- the CRC32 uses the standard IEEE polynomial
+- the hash is computed over the payload bytes only
+- zero-length payloads are valid
+- the maximum payload size is 1 MiB
+
+Oversized direct RPC calls fail as application/RPC errors rather than being
+silently truncated.
 
 ## `rpc-bench-server`
 
-The server owns one `asio::io_context`, one TCP acceptor, and one coroutine per
-connection. It is intentionally single-threaded in this milestone.
+The server owns one KJ event loop, listens on one endpoint, and serves the
+hashing capability over Cap'n Proto's two-party RPC transport.
 
 Example:
 
@@ -54,15 +77,15 @@ on `stderr`.
 
 ## `rpc-bench-bench`
 
-The benchmark supports two modes:
+The benchmark keeps the existing two modes:
 
 - `spawn-local`: launch one local `rpc-bench-server` child process
 - `connect`: benchmark one already running endpoint
 
 Each benchmark run uses:
 
-- one thread per connection
-- one TCP socket per thread
+- one OS thread per connection
+- one RPC connection per thread
 - one outstanding request per connection
 - one warmup phase and one measured phase
 - per-request payload sizes sampled uniformly from an inclusive range
@@ -106,7 +129,7 @@ provided.
 The benchmark prints a terminal summary and can also emit JSON with
 `--json-output=PATH`.
 
-Both outputs include:
+Both outputs keep the existing field names and include:
 
 - mode and endpoint
 - client thread count
@@ -116,11 +139,16 @@ Both outputs include:
 - request, response, and combined throughput
 - RTT latency percentiles: `p50`, `p75`, `p90`, `p99`, `p99.9`
 
-Latency is measured from the start of the request send until the full 4-byte
-response is received.
+The reported byte counters intentionally preserve the earlier logical framing
+accounting:
+
+- `requestBytes` counts `4 + payload_size` for each successful measured RPC
+- `responseBytes` counts `4` for each successful measured RPC
+
+These are compatibility-oriented metrics, not literal Cap'n Proto wire bytes.
 
 ## Verification Scope
 
-This milestone intentionally does not reintroduce automated tests or coverage
-reporting. Verification is limited to building the project and running manual
-`spawn-local` and `connect` smoke benchmarks.
+This milestone does not keep repo-managed automated tests or a coverage target.
+Verification is limited to configuring and building the project plus manual
+`spawn-local` and `connect` smoke runs.

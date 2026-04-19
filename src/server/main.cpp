@@ -3,6 +3,8 @@
 #include "server/server.hpp"
 
 #include <exception>
+#include <kj/exception.h>
+#include <kj/string.h>
 #include <print>
 #include <span>
 #include <string_view>
@@ -32,6 +34,9 @@ int main(int argc, char** argv) {
 
     rpcbench::ServerApp app(*config);
     return app.run();
+  } catch (const kj::Exception& exception) {
+    std::println(stderr, "error: {}", kj::str(exception).cStr());
+    return 1;
   } catch (const std::exception& exception) {
     std::println(stderr, "error: {}", exception.what());
     return 1;

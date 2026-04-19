@@ -1,8 +1,8 @@
 #pragma once
 
-// CRC32 helpers for the framed TCP benchmark protocol. The server uses this to
-// hash request payloads, and the benchmark uses the same function for optional
-// local cross-checking and stable documentation of the wire semantics.
+// CRC32 helpers for the benchmark service. The server uses this to hash RPC
+// payloads, and the benchmark reuses the same function in tests and docs to
+// keep the service contract stable.
 
 #include <cstddef>
 #include <cstdint>

@@ -1,6 +1,6 @@
 #pragma once
 
-// Benchmark frontend for the CRC32 TCP service. This layer owns CLI parsing,
+// Benchmark frontend for the CRC32 RPC service. This layer owns CLI parsing,
 // spawn-local process management, workload generation, and report rendering for
 // one benchmark invocation.
 
@@ -32,7 +32,7 @@ struct BenchConfig {
   std::string listen_host = "127.0.0.1";
   std::uint16_t server_port = 7300;
 
-  // One client thread and one TCP connection per thread.
+  // One client thread and one RPC connection per thread.
   std::size_t client_threads = 1;
 
   // Inclusive request payload size range.
@@ -77,7 +77,8 @@ struct BenchmarkResult {
   std::size_t client_threads = 0;
   MessageSizeRange message_sizes;
 
-  // Measured traffic counters.
+  // Measured traffic counters. These intentionally preserve the legacy logical
+  // request/reply accounting used by earlier framed-TCP reports.
   std::uint64_t total_requests = 0;
   std::uint64_t errors = 0;
   std::uint64_t request_bytes = 0;

@@ -1,7 +1,8 @@
 #pragma once
 
 // Server frontend for the CRC32 benchmark. This layer owns the CLI-facing
-// configuration and the single-threaded async listener lifecycle built on Asio.
+// configuration and the blocking lifecycle around the single-threaded KJ event
+// loop that hosts the Cap'n Proto RPC listener.
 
 #include "protocol/common.hpp"
 
@@ -36,8 +37,8 @@ parse_server_config(std::span<const std::string_view> args);
 [[nodiscard]] std::string server_usage(std::string_view program_name);
 
 class ServerApp {
-  // Owns the blocking server lifecycle. A single instance runs one acceptor and
-  // one coroutine-driven request loop per accepted connection.
+  // Owns the blocking server lifecycle. One instance runs one listener and one
+  // KJ event loop until shutdown is requested.
 public:
   explicit ServerApp(ServerConfig config);
 

@@ -1,20 +1,14 @@
-// Benchmark runner for the CRC32 TCP service. The implementation intentionally
+// Benchmark runner for the CRC32 RPC service. The implementation intentionally
 // stays closed-loop and single-endpoint so reported latency and throughput map
 // directly to the actual request/response path that executed.
 
 #include "bench/benchmark.hpp"
 
-#include "protocol/framing.hpp"
+#include "protocol/hash_service.capnp.h"
 
 #include <algorithm>
-#include <array>
-#include <asio/connect.hpp>
-#include <asio/io_context.hpp>
-#include <asio/ip/tcp.hpp>
-#include <asio/read.hpp>
-#include <asio/socket_base.hpp>
-#include <asio/write.hpp>
 #include <barrier>
+#include <capnp/rpc-twoparty.h>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -22,9 +16,11 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <optional>
-#include <print>
+#include <kj/async-io.h>
+#include <kj/exception.h>
+#include <kj/string.h>
 #include <random>
+#include <span>
 #include <string_view>
 #include <sys/wait.h>
 #include <thread>
@@ -35,9 +31,9 @@
 namespace rpcbench {
 namespace {
 
-namespace asio_ns = asio;
-using tcp = asio_ns::ip::tcp;
 using Clock = std::chrono::steady_clock;
+inline constexpr std::uint64_t kReportedRequestEnvelopeBytes = 4;
+inline constexpr std::uint64_t kReportedResponseEnvelopeBytes = 4;
 
 struct ThreadStats {
   // These counters describe one client thread's measured contribution so the
@@ -118,6 +114,29 @@ struct PayloadGenerator {
   std::uniform_int_distribution<std::size_t> size_distribution;
   std::uniform_int_distribution<unsigned int> byte_distribution;
 };
+
+// Formats KJ exceptions into stable user-facing strings for benchmark errors.
+[[nodiscard]] std::string describe_kj_exception(const kj::Exception& exception) {
+  return kj::str(exception).cStr();
+}
+
+[[nodiscard]] capnp::Data::Reader to_data_reader(std::span<const std::byte> payload) {
+  return {
+      reinterpret_cast<const capnp::byte*>(payload.data()),
+      payload.size(),
+  };
+}
+
+// Sends one unary RPC and waits for the full response before returning. The
+// benchmark deliberately uses blocking waits at the thread top level so each
+// thread keeps exactly one request in flight at a time.
+[[nodiscard]] std::uint32_t send_hash_request(HashService::Client& hash_service,
+                                              std::span<const std::byte> payload,
+                                              kj::WaitScope& wait_scope) {
+  auto request = hash_service.hashRequest();
+  request.setPayload(to_data_reader(payload));
+  return request.send().wait(wait_scope).getCrc32();
+}
 
 [[nodiscard]] std::filesystem::path default_server_binary_path(const std::filesystem::path& argv0) {
   std::error_code error;
@@ -240,55 +259,49 @@ spawn_process(const std::filesystem::path& program, const std::vector<std::strin
 
 [[nodiscard]] std::expected<void, std::string>
 wait_for_endpoint_ready(const Endpoint& endpoint, std::chrono::milliseconds timeout) {
-  asio_ns::io_context io_context;
-  tcp::resolver resolver(io_context);
-  std::error_code error;
-  const auto endpoints = resolver.resolve(endpoint.host, std::to_string(endpoint.port), error);
-  if (error) {
-    return std::unexpected(
-        std::format("could not resolve endpoint '{}': {}", endpoint.to_string(), error.message()));
-  }
-
   const auto deadline = Clock::now() + timeout;
   while (Clock::now() < deadline) {
-    tcp::socket socket(io_context);
-    asio_ns::connect(socket, endpoints, error);
-    if (!error) {
-      socket.close();
+    try {
+      auto io_context = kj::setupAsyncIo();
+      auto address = io_context.provider->getNetwork()
+                         .parseAddress(endpoint.host.c_str(), endpoint.port)
+                         .wait(io_context.waitScope);
+      auto connection = address->connect().wait(io_context.waitScope);
+      capnp::TwoPartyClient rpc_client(*connection);
+      auto hash_service = rpc_client.bootstrap().castAs<HashService>();
+      static_cast<void>(
+          send_hash_request(hash_service, std::span<const std::byte>{}, io_context.waitScope));
       return {};
+    } catch (const kj::Exception&) {
+    } catch (const std::exception&) {
     }
+
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
 
   return std::unexpected(std::format("endpoint did not become ready: {}", endpoint.to_string()));
 }
 
-void run_phase(tcp::socket& socket,
+void run_phase(HashService::Client& hash_service,
                PayloadGenerator& generator,
                double seconds,
-               ThreadStats* stats) {
+               ThreadStats* stats,
+               kj::WaitScope& wait_scope) {
   // Each phase is closed-loop: a thread sends the next request only after the
-  // previous 4-byte reply has been read completely.
+  // previous RPC reply has been received completely.
   const auto deadline = Clock::now() + std::chrono::duration<double>(seconds);
   const auto phase_start = Clock::now();
 
   while (Clock::now() < deadline) {
     auto payload = generator.next_payload();
-    const auto header = encode_be32(static_cast<std::uint32_t>(payload.size()));
-    std::array<std::byte, kFrameHeaderBytes> reply{};
-
     const auto start = Clock::now();
-    asio_ns::write(socket, asio_ns::buffer(header));
-    if (!payload.empty()) {
-      asio_ns::write(socket, asio_ns::buffer(payload));
-    }
-    asio_ns::read(socket, asio_ns::buffer(reply));
+    static_cast<void>(send_hash_request(hash_service, payload, wait_scope));
     const auto end = Clock::now();
 
     if (stats != nullptr) {
       ++stats->total_requests;
-      stats->request_bytes += header.size() + payload.size();
-      stats->response_bytes += reply.size();
+      stats->request_bytes += kReportedRequestEnvelopeBytes + payload.size();
+      stats->response_bytes += kReportedResponseEnvelopeBytes;
       stats->latencies_ns.push_back(static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
     }
@@ -308,24 +321,41 @@ void run_phase(tcp::socket& socket,
   bool joined_measure = false;
 
   try {
-    asio_ns::io_context io_context;
-    tcp::resolver resolver(io_context);
-    auto endpoints = resolver.resolve(endpoint.host, std::to_string(endpoint.port));
-
-    tcp::socket socket(io_context);
-    asio_ns::connect(socket, endpoints);
-    socket.set_option(tcp::no_delay(true));
+    auto io_context = kj::setupAsyncIo();
+    auto address = io_context.provider->getNetwork()
+                       .parseAddress(endpoint.host.c_str(), endpoint.port)
+                       .wait(io_context.waitScope);
+    auto connection = address->connect().wait(io_context.waitScope);
+    capnp::TwoPartyClient rpc_client(*connection);
+    auto hash_service = rpc_client.bootstrap().castAs<HashService>();
 
     PayloadGenerator generator(thread_index, config.message_sizes, config.seed);
     warmup_barrier.arrive_and_wait();
     joined_warmup = true;
-    run_phase(socket, generator, config.warmup_seconds, nullptr);
+    run_phase(hash_service, generator, config.warmup_seconds, nullptr, io_context.waitScope);
 
     measure_barrier.arrive_and_wait();
     joined_measure = true;
     ThreadResult result;
-    run_phase(socket, generator, config.measure_seconds, &result.stats);
+    run_phase(hash_service, generator, config.measure_seconds, &result.stats, io_context.waitScope);
     return result;
+  } catch (const kj::Exception& exception) {
+    if (!joined_warmup) {
+      warmup_barrier.arrive_and_drop();
+      measure_barrier.arrive_and_drop();
+    } else if (!joined_measure) {
+      measure_barrier.arrive_and_drop();
+    }
+
+    return ThreadResult{
+        .stats =
+            ThreadStats{
+                .errors = 1,
+                .latencies_ns = {},
+            },
+        .error = std::format(
+            "client thread {} failed: {}", thread_index, describe_kj_exception(exception)),
+    };
   } catch (const std::exception& exception) {
     if (!joined_warmup) {
       warmup_barrier.arrive_and_drop();
@@ -608,16 +638,16 @@ std::string bench_usage(std::string_view program_name) {
                      "  --server-binary=PATH         Server binary for spawn-local mode\n"
                      "  --listen-host=HOST           Spawn-local bind host. Default: 127.0.0.1\n"
                      "  --server-port=PORT           Spawn-local port. Default: 7300\n"
-                     "  --client-threads=N          Client thread count. Default: 1\n"
-                     "  --message-size-min=N        Inclusive minimum payload size. Default: 128\n"
-                     "  --message-size-max=N        Inclusive maximum payload size. Default: 256\n"
-                     "  --warmup-seconds=SECONDS    Warmup duration. Default: 1.0\n"
-                     "  --measure-seconds=SECONDS   Measured duration. Default: 3.0\n"
-                     "  --seed=N                    Deterministic payload seed. Default: 1\n"
-                     "  --startup-timeout-ms=N      Spawn-local startup timeout. Default: 5000\n"
-                     "  --json-output=PATH          Optional JSON report path\n"
-                     "  --quiet-server              Suppress the child server banner\n"
-                     "  --help                      Show this message\n",
+                     "  --client-threads=N           Client thread count. Default: 1\n"
+                     "  --message-size-min=N         Inclusive minimum payload size. Default: 128\n"
+                     "  --message-size-max=N         Inclusive maximum payload size. Default: 256\n"
+                     "  --warmup-seconds=SECONDS     Warmup duration. Default: 1.0\n"
+                     "  --measure-seconds=SECONDS    Measured duration. Default: 3.0\n"
+                     "  --seed=N                     Deterministic payload seed. Default: 1\n"
+                     "  --startup-timeout-ms=N       Spawn-local startup timeout. Default: 5000\n"
+                     "  --json-output=PATH           Optional JSON report path\n"
+                     "  --quiet-server               Suppress the child server banner\n"
+                     "  --help                       Show this message\n",
                      program_name);
 }
 

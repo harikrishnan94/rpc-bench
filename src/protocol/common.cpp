@@ -1,6 +1,6 @@
 // Shared protocol-side parsing and endpoint utilities. These helpers keep the
 // server and benchmark frontends aligned on mode names, endpoint syntax, and
-// the hard request-size contract.
+// the hard payload-size contract.
 
 #include "protocol/common.hpp"
 
@@ -21,9 +21,9 @@ std::expected<void, std::string> MessageSizeRange::validate() const {
   if (min > max) {
     return std::unexpected("message-size-min must be less than or equal to message-size-max");
   }
-  if (max > kMaxFrameSizeBytes) {
+  if (max > kMaxPayloadSizeBytes) {
     return std::unexpected(
-        std::format("message sizes must be less than or equal to {} bytes", kMaxFrameSizeBytes));
+        std::format("message sizes must be less than or equal to {} bytes", kMaxPayloadSizeBytes));
   }
   return {};
 }

@@ -1,8 +1,8 @@
 #pragma once
 
-// Shared protocol helpers for the clean-slate TCP benchmark. This header keeps
-// wire-size limits, endpoint parsing, and small CLI parsing utilities in one
-// internal place so the server and benchmark agree on the same contract.
+// Shared endpoint, payload-limit, and CLI helpers for the CRC32 benchmark.
+// Keeping these rules in one internal header ensures the server, benchmark, and
+// tests all enforce the same user-visible contract.
 
 #include <charconv>
 #include <cstddef>
@@ -17,7 +17,7 @@ namespace rpcbench {
 
 inline constexpr std::size_t kDefaultMessageSizeMin = 128;
 inline constexpr std::size_t kDefaultMessageSizeMax = 256;
-inline constexpr std::uint32_t kMaxFrameSizeBytes = 1024U * 1024U;
+inline constexpr std::uint32_t kMaxPayloadSizeBytes = 1024U * 1024U;
 
 enum class BenchMode : std::uint8_t {
   connect,
@@ -38,11 +38,11 @@ struct Endpoint {
 struct MessageSizeRange {
   // Inclusive lower and upper request-payload bounds in bytes. Zero-length
   // payloads are allowed when explicitly requested, but the range may never
-  // exceed the protocol frame size limit.
+  // exceed the service's 1 MiB payload limit.
   std::size_t min = kDefaultMessageSizeMin;
   std::size_t max = kDefaultMessageSizeMax;
 
-  // Validates ordering and the hard protocol frame cap.
+  // Validates ordering and the hard payload cap.
   [[nodiscard]] std::expected<void, std::string> validate() const;
 };
 
