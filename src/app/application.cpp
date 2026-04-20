@@ -217,21 +217,21 @@ std::string server_usage(std::string_view program_name) {
                      "\n"
                      "Options:\n"
                      "  --listen-uri=URI          Listen target. Default: tcp://127.0.0.1:7000\n"
-                     "  --server-threads=N        Requested server thread count. Default: 1\n"
+                     "  --server-threads=N        Serving worker thread count. Default: 1\n"
                      "  --quiet                   Suppress the startup banner\n"
                      "  --help                    Show this message\n",
                      program_name);
 }
 
 int run_server_app(const ServerConfig& config) {
-  ServerTransportConfig transport_config{
+  const ServerTransportConfig transport_config{
       .listen_uri = config.listen_uri,
       .server_threads = config.server_threads,
       .quiet = config.quiet,
       .ready_fd = config.ready_fd,
       .preconnected_stream_fds = config.preconnected_stream_fds,
   };
-  return run_server_transport(transport_config, make_hash_service_bootstrap());
+  return run_server_transport(transport_config, make_hash_service_bootstrap);
 }
 
 std::expected<BenchConfig, std::string> parse_bench_config(std::span<const std::string_view> args,
@@ -385,7 +385,7 @@ std::string bench_usage(std::string_view program_name) {
       "  --connect-uri=URI          Target URI for connect mode\n"
       "  --listen-uri=URI           Spawn-local listen URI. Default: tcp://127.0.0.1:7300\n"
       "  --server-binary=PATH       Server binary for spawn-local mode\n"
-      "  --server-threads=N         Spawn-local server thread count. Default: 1\n"
+      "  --server-threads=N         Spawn-local serving worker count. Default: 1\n"
       "  --client-threads=N         Number of benchmark event-loop threads. Default: 1\n"
       "  --client-connections=N     Total client connections. Default: 1\n"
       "  --message-size-min=N       Minimum request payload bytes. Default: 128\n"

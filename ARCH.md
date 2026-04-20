@@ -10,8 +10,7 @@ CRC32 hash of a request payload. The observable system consists of:
 - `rpc-bench-bench`, a benchmark driver that targets one server at a time
 
 The implementation is intentionally small and explicit. This version does not
-define persistence, sharding, multi-target runs, or multi-threaded server
-execution.
+define persistence, sharding, or multi-target runs.
 
 An internal application layer owns CLI parsing and URI/mode policy. The bench
 and server runtime layers below it operate on async stream abstractions rather
@@ -73,16 +72,27 @@ Supported URI kinds:
 
 ### Runtime model
 
-- One server process owns one KJ async event loop.
+- One server process owns one acceptor runtime plus one or more serving
+  runtimes.
+- For `tcp://...` and `unix://...`, the acceptor owns one KJ async event loop
+  that binds the listener and accepts network streams.
+- `server_threads` means the number of serving worker runtimes for
+  `tcp://...` and `unix://...`. Each worker owns one KJ async event loop.
+- Accepted network connections are assigned round-robin from the acceptor to
+  the workers.
+- For `pipe://socketpair`, the server stays on one KJ async event loop and
+  does not create extra workers.
 - Every accepted or pre-created session is serviced through one
   `TwoPartyVatNetwork` plus one `RpcSystem`.
-- The server exports one bootstrap capability that implements the hash RPC.
-- The server remains single-threaded in this milestone.
+- Each serving runtime exports one bootstrap capability that implements the
+  hash RPC.
 
 ### Transport-specific session setup
 
 - For `tcp://...` and `unix://...`, the server resolves the URI through KJ,
-  binds one listener, and accepts streams from that listener.
+  binds one listener on the acceptor thread, accepts streams from that
+  listener, duplicates the accepted fd, and asks the selected worker thread to
+  wrap and serve that stream.
 - For `pipe://socketpair`, the benchmark parent creates one socketpair per
   logical client connection before spawning the child server. The child wraps
   the inherited server ends into KJ streams and serves them as pre-connected
@@ -91,20 +101,25 @@ Supported URI kinds:
 ### Server thread policy
 
 - The public CLI keeps `--server-threads=N`.
+- For `tcp://...` and `unix://...`, `N` counts serving workers only. The
+  hidden acceptor thread is not included in that count.
 - The benchmark rejects `--server-threads` in `connect` mode because it cannot
   configure an already-running server.
-- The server process itself rejects values greater than `1`. The benchmark does
-  not pre-empt that spawn-local failure.
+- For `pipe://socketpair`, the server process rejects values greater than `1`.
+  The benchmark does not pre-empt that spawn-local failure.
 
 ### Lifecycle
 
-- In spawn-local mode the server completes its transport-specific startup before
-  notifying the benchmark parent through a ready pipe.
+- In spawn-local mode the server completes its transport-specific startup
+  before notifying the benchmark parent through a ready pipe.
+- For `tcp://...` and `unix://...`, readiness means the listener is bound and
+  all serving workers have started.
 - Unless `--quiet` is set, the server prints one startup banner with the bound
   URI.
 - `SIGINT` and `SIGTERM` are captured through KJ's Unix event port and cancel
-  server work from within the event loop.
-- After shutdown is requested, the process exits the event loop and terminates.
+  server work from within the acceptor event loop.
+- After shutdown is requested, the acceptor stops accepting, pending handoffs
+  finish, and the serving workers exit.
 
 ## Benchmark Semantics
 
@@ -191,11 +206,14 @@ a public SDK surface in this version.
 
 ## Design Decisions And Trade-offs
 
-### Why keep every server transport on one KJ event loop
+### Why use one acceptor plus worker loops for network transports
 
-The benchmark is intended to compare transport paths without changing the basic
-server execution model. Keeping all transports on one KJ event loop removes a
-major source of runtime variation and keeps shutdown behavior consistent.
+The benchmark needs a real `--server-threads=N` network path without moving KJ
+objects across threads unsafely. Keeping listener ownership on one acceptor
+thread and handing accepted fds to worker event loops preserves KJ's
+thread-local event-loop model while still allowing parallel request servicing.
+The trade-off is one hidden extra thread plus an fd-duplication handoff on each
+accepted network connection.
 
 ### Why keep the runtime stream-only
 
@@ -219,6 +237,13 @@ pipe-based runs still speak Cap'n Proto RPC messages internally.
 Restricting it to spawn-local mode keeps the public CLI simple and avoids
 defining an external descriptor handoff protocol.
 
+### Why keep `pipe://socketpair` single-threaded
+
+`pipe://socketpair` already models one pre-connected stream per logical client
+connection. Keeping that transport on one event loop avoids inventing a second
+handoff layer for inherited descriptors when the benchmark's main threading
+goal is network-server parallelism.
+
 ### Why keep one outstanding request per connection
 
 One in-flight request per connection keeps RTT semantics unambiguous while
@@ -235,7 +260,6 @@ metrics rather than literal on-the-wire Cap'n Proto sizes.
 
 ## Non-goals For This Milestone
 
-- multi-threaded server execution
 - multiple targets in one benchmark invocation
 - persistence or recovery semantics
 - any shared-memory transport

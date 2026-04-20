@@ -26,9 +26,9 @@ struct ServerConfig {
       .port = 7000,
   };
 
-  // Requested server thread count. Values greater than `1` are parsed but
-  // rejected by the server runtime itself so spawn-local failures come from the
-  // child server process rather than from the benchmark CLI.
+  // Requested server worker-loop count. For network transports the server may
+  // add one hidden acceptor thread on top of these serving workers, while
+  // pipe://socketpair keeps its single-loop restriction in the server runtime.
   std::size_t server_threads = 1;
 
   // Suppresses the startup banner when true.
@@ -59,7 +59,7 @@ struct BenchConfig {
       .port = 7300,
   };
 
-  // Requested server thread count forwarded only in spawn-local mode.
+  // Requested server worker-loop count forwarded only in spawn-local mode.
   std::size_t server_threads = 1;
 
   // Benchmark runtime options shared by both connect and spawn-local modes.

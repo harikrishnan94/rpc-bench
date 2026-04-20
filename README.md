@@ -7,10 +7,12 @@ repository builds:
 - `rpc-bench-server`
 - `rpc-bench-bench`
 
-The current implementation keeps one Cap'n Proto RPC contract and one KJ event
-loop on the server for every supported transport. An internal application layer
-parses CLI URIs and run modes, while the bench and server runtime layers talk
-only in terms of async stream-backed RPC sessions.
+The current implementation keeps one Cap'n Proto RPC contract across all
+transports. `tcp://...` and `unix://...` use one acceptor KJ event loop plus a
+configurable number of serving worker event loops, while `pipe://socketpair`
+remains single-loop. An internal application layer parses CLI URIs and run
+modes, while the bench and server runtime layers talk only in terms of async
+stream-backed RPC sessions.
 
 ## System Prerequisites
 
@@ -95,15 +97,24 @@ Transport restrictions:
 
 ## `rpc-bench-server`
 
-The server owns one KJ event loop for every transport and serves one bootstrap
-capability over Cap'n Proto two-party RPC.
+The server serves one bootstrap capability over Cap'n Proto two-party RPC.
+
+For `tcp://...` and `unix://...`, the runtime uses:
+
+- one hidden acceptor thread with its own KJ event loop
+- `--server-threads=N` serving worker threads, each with its own KJ event loop
+- round-robin handoff of accepted network connections from the acceptor to the
+  workers
+
+For `pipe://socketpair`, the runtime stays on one KJ event loop and only
+supports `--server-threads=1`.
 
 Example:
 
 ```sh
 ./builddir/src/rpc-bench-server \
   --listen-uri=tcp://127.0.0.1:7000 \
-  --server-threads=1
+  --server-threads=2
 ```
 
 Unix-domain example:
@@ -117,8 +128,9 @@ Unix-domain example:
 `pipe://socketpair` is intended for `spawn-local` mode, where the benchmark
 process supplies the inherited descriptors for the child server automatically.
 
-The server accepts `--server-threads=N`, but the current runtime is still
-single-threaded and rejects values greater than `1`.
+`--server-threads=N` counts serving worker threads only. For `tcp://...` and
+`unix://...`, the server adds one hidden acceptor thread on top of those
+workers. `pipe://socketpair` still rejects values greater than `1`.
 
 Use `--quiet` to suppress the startup banner while keeping warnings and errors
 on `stderr`.
@@ -146,7 +158,7 @@ Example `spawn-local` TCP run:
 ./builddir/src/rpc-bench-bench \
   --mode=spawn-local \
   --listen-uri=tcp://127.0.0.1:7300 \
-  --server-threads=1 \
+  --server-threads=2 \
   --client-threads=2 \
   --client-connections=4 \
   --message-size-min=128 \

@@ -8,7 +8,7 @@
 
 namespace rpcbench {
 
-// Returns the bootstrap capability that implements the hash RPC.
+// Returns a fresh bootstrap capability that implements the hash RPC.
 [[nodiscard]] capnp::Capability::Client make_hash_service_bootstrap();
 
 } // namespace rpcbench

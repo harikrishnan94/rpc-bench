@@ -13,6 +13,9 @@
 
 namespace rpcbench {
 
+// Creates a fresh server bootstrap capability for one serving runtime.
+using ServerBootstrapFactory = capnp::Capability::Client (*)();
+
 struct ServerTransportConfig {
   // URI that defines the server transport and listen target.
   TransportUri listen_uri{
@@ -21,8 +24,8 @@ struct ServerTransportConfig {
       .port = 7000,
   };
 
-  // Requested server thread count. Values greater than `1` are rejected here
-  // so the error comes from the server process itself.
+  // Requested server worker-loop count for network transports. The runtime may
+  // add one hidden acceptor thread on top of these serving workers.
   std::size_t server_threads = 1;
 
   // Suppresses the startup banner when true.
@@ -36,6 +39,7 @@ struct ServerTransportConfig {
 };
 
 // Runs the full transport-specific server lifecycle for one listen target.
-int run_server_transport(const ServerTransportConfig& config, capnp::Capability::Client bootstrap);
+int run_server_transport(const ServerTransportConfig& config,
+                         ServerBootstrapFactory bootstrap_factory);
 
 } // namespace rpcbench

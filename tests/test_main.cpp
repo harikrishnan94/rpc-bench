@@ -297,6 +297,12 @@ void test_server_config_pipe_requires_fds() {
   expect_contains(config.error(), "requires internal preconnected fds");
 }
 
+void test_server_config_rejects_zero_threads() {
+  auto config = rpcbench::parse_server_config(make_args({"--server-threads=0"}));
+  require(!config.has_value(), "server config should reject zero threads");
+  expect_contains(config.error(), "greater than zero");
+}
+
 void test_bench_config_parser() {
   auto config = rpcbench::parse_bench_config(make_args({
                                                  "--mode=spawn-local",
@@ -350,6 +356,13 @@ void test_bench_connect_rejects_pipe_uri() {
   expect_contains(config.error(), "does not support pipe://socketpair");
 }
 
+void test_bench_spawn_local_rejects_zero_server_threads() {
+  auto config = rpcbench::parse_bench_config(
+      make_args({"--mode=spawn-local", "--server-threads=0"}), "/tmp/rpc-bench-bench");
+  require(!config.has_value(), "spawn-local mode should reject zero server threads");
+  expect_contains(config.error(), "greater than zero");
+}
+
 void test_benchmark_result_formatting() {
   rpcbench::BenchmarkResult result{
       .mode = "spawn-local",
@@ -388,15 +401,15 @@ void test_benchmark_result_formatting() {
   expect_contains(json, "\"mode\":\"spawn-local\"");
 }
 
-void test_server_runtime_rejects_multithreaded() {
-  const auto process =
-      run_process_capture(server_path(),
-                          {
-                              std::format("--listen-uri=tcp://127.0.0.1:{}", test_port(1)),
-                              "--server-threads=2",
-                          });
-  require(process.exit_status != 0, "server should reject multi-threaded mode");
-  expect_contains(process.stderr_text, "--server-threads must be 1");
+void test_server_runtime_rejects_multithreaded_pipe() {
+  const auto process = run_process_capture(server_path(),
+                                           {
+                                               "--listen-uri=pipe://socketpair",
+                                               "--server-threads=2",
+                                               "--internal-preconnected-fds=0",
+                                           });
+  require(process.exit_status != 0, "pipe server should reject multi-threaded mode");
+  expect_contains(process.stderr_text, "pipe://socketpair only supports --server-threads=1");
 }
 
 void test_spawn_local_server_rejection_surfaces() {
@@ -413,7 +426,7 @@ void test_spawn_local_server_rejection_surfaces() {
                                                "--measure-seconds=0.02",
                                            });
   require(process.exit_status != 0, "spawn-local run should fail when server rejects threads");
-  expect_contains(process.stderr_text, "--server-threads must be 1");
+  expect_contains(process.stderr_text, "pipe://socketpair only supports --server-threads=1");
 }
 
 void test_connect_mode_tcp() {
@@ -477,6 +490,68 @@ void test_connect_mode_unix() {
   expect_contains(process.stdout_text, "Client connections: 3");
 }
 
+void test_connect_mode_tcp_multithreaded_server() {
+  const auto port = test_port(6);
+  auto server = spawn_background_process(server_path(),
+                                         {
+                                             std::format("--listen-uri=tcp://127.0.0.1:{}", port),
+                                             "--server-threads=2",
+                                             "--quiet",
+                                         });
+  wait_for_tcp_ready(port);
+
+  const auto process =
+      run_process_capture(bench_path(),
+                          {
+                              "--mode=connect",
+                              std::format("--connect-uri=tcp://127.0.0.1:{}", port),
+                              "--client-threads=2",
+                              "--client-connections=4",
+                              "--message-size-min=16",
+                              "--message-size-max=32",
+                              "--warmup-seconds=0.02",
+                              "--measure-seconds=0.05",
+                              "--seed=6",
+                          });
+  require(process.exit_status == 0,
+          "tcp connect benchmark should succeed with multi-threaded server");
+  expect_contains(process.stdout_text, "Mode: connect");
+  expect_contains(process.stdout_text, std::format("Endpoint: tcp://127.0.0.1:{}", port));
+  expect_contains(process.stdout_text, "Client connections: 4");
+}
+
+void test_connect_mode_unix_multithreaded_server() {
+  const auto path = test_socket_path(7);
+  std::filesystem::remove(path);
+
+  auto server = spawn_background_process(server_path(),
+                                         {
+                                             std::format("--listen-uri=unix://{}", path.string()),
+                                             "--server-threads=2",
+                                             "--quiet",
+                                         });
+  wait_for_unix_ready(path);
+
+  const auto process =
+      run_process_capture(bench_path(),
+                          {
+                              "--mode=connect",
+                              std::format("--connect-uri=unix://{}", path.string()),
+                              "--client-threads=2",
+                              "--client-connections=4",
+                              "--message-size-min=16",
+                              "--message-size-max=32",
+                              "--warmup-seconds=0.02",
+                              "--measure-seconds=0.05",
+                              "--seed=7",
+                          });
+  require(process.exit_status == 0,
+          "unix connect benchmark should succeed with multi-threaded server");
+  expect_contains(process.stdout_text, "Mode: connect");
+  expect_contains(process.stdout_text, std::format("Endpoint: unix://{}", path.string()));
+  expect_contains(process.stdout_text, "Client connections: 4");
+}
+
 void test_spawn_local_tcp() {
   const auto port = test_port(4);
   const auto process =
@@ -499,6 +574,31 @@ void test_spawn_local_tcp() {
   expect_contains(process.stdout_text, "Mode: spawn-local");
   expect_contains(process.stdout_text, std::format("Endpoint: tcp://127.0.0.1:{}", port));
   expect_contains(process.stdout_text, "Client connections: 3");
+}
+
+void test_spawn_local_tcp_multithreaded_server() {
+  const auto port = test_port(8);
+  const auto process =
+      run_process_capture(bench_path(),
+                          {
+                              "--mode=spawn-local",
+                              std::format("--listen-uri=tcp://127.0.0.1:{}", port),
+                              std::format("--server-binary={}", server_path().string()),
+                              "--server-threads=2",
+                              "--client-threads=2",
+                              "--client-connections=4",
+                              "--message-size-min=16",
+                              "--message-size-max=32",
+                              "--warmup-seconds=0.02",
+                              "--measure-seconds=0.05",
+                              "--seed=8",
+                              "--quiet-server",
+                          });
+  require(process.exit_status == 0,
+          "spawn-local tcp benchmark should succeed with multi-threaded server");
+  expect_contains(process.stdout_text, "Mode: spawn-local");
+  expect_contains(process.stdout_text, std::format("Endpoint: tcp://127.0.0.1:{}", port));
+  expect_contains(process.stdout_text, "Client connections: 4");
 }
 
 void test_spawn_local_unix() {
@@ -527,6 +627,33 @@ void test_spawn_local_unix() {
   expect_contains(process.stdout_text, "Client connections: 3");
 }
 
+void test_spawn_local_unix_multithreaded_server() {
+  const auto path = test_socket_path(9);
+  std::filesystem::remove(path);
+
+  const auto process =
+      run_process_capture(bench_path(),
+                          {
+                              "--mode=spawn-local",
+                              std::format("--listen-uri=unix://{}", path.string()),
+                              std::format("--server-binary={}", server_path().string()),
+                              "--server-threads=2",
+                              "--client-threads=2",
+                              "--client-connections=4",
+                              "--message-size-min=16",
+                              "--message-size-max=32",
+                              "--warmup-seconds=0.02",
+                              "--measure-seconds=0.05",
+                              "--seed=9",
+                              "--quiet-server",
+                          });
+  require(process.exit_status == 0,
+          "spawn-local unix benchmark should succeed with multi-threaded server");
+  expect_contains(process.stdout_text, "Mode: spawn-local");
+  expect_contains(process.stdout_text, std::format("Endpoint: unix://{}", path.string()));
+  expect_contains(process.stdout_text, "Client connections: 4");
+}
+
 void test_spawn_local_pipe() {
   const auto process =
       run_process_capture(bench_path(),
@@ -550,24 +677,44 @@ void test_spawn_local_pipe() {
   expect_contains(process.stdout_text, "Client connections: 3");
 }
 
+void test_server_help_output() {
+  const auto process = run_process_capture(server_path(), {"--help"});
+  require(process.exit_status == 0, "server help should succeed");
+  expect_contains(process.stdout_text, "Serving worker thread count");
+}
+
+void test_bench_help_output() {
+  const auto process = run_process_capture(bench_path(), {"--help"});
+  require(process.exit_status == 0, "benchmark help should succeed");
+  expect_contains(process.stdout_text, "Spawn-local serving worker count");
+}
+
 } // namespace
 
 int main() {
   try {
     test_server_config_parser();
     test_server_config_pipe_requires_fds();
+    test_server_config_rejects_zero_threads();
     test_bench_config_parser();
     test_bench_config_rejects_queue_depths();
     test_bench_connect_rejects_server_threads();
     test_bench_connect_rejects_pipe_uri();
+    test_bench_spawn_local_rejects_zero_server_threads();
     test_benchmark_result_formatting();
-    test_server_runtime_rejects_multithreaded();
+    test_server_runtime_rejects_multithreaded_pipe();
     test_spawn_local_server_rejection_surfaces();
     test_connect_mode_tcp();
     test_connect_mode_unix();
+    test_connect_mode_tcp_multithreaded_server();
+    test_connect_mode_unix_multithreaded_server();
     test_spawn_local_tcp();
     test_spawn_local_unix();
+    test_spawn_local_tcp_multithreaded_server();
+    test_spawn_local_unix_multithreaded_server();
     test_spawn_local_pipe();
+    test_server_help_output();
+    test_bench_help_output();
     return 0;
   } catch (const TestFailure& failure) {
     std::fprintf(stderr, "test failure: %s\n", failure.what());

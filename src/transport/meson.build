@@ -9,11 +9,11 @@ rpcbench_transport = static_library(
     'uri.cpp',
   ),
   include_directories : [rpcbench_transport_inc],
-  dependencies : [rpcbench_protocol_dep, rpcbench_bench_runtime_dep],
+  dependencies : [rpcbench_protocol_dep, rpcbench_bench_runtime_dep, threads_dep],
 )
 
 rpcbench_transport_dep = declare_dependency(
   link_with : rpcbench_transport,
   include_directories : [rpcbench_transport_inc],
-  dependencies : [rpcbench_protocol_dep, rpcbench_bench_runtime_dep],
+  dependencies : [rpcbench_protocol_dep, rpcbench_bench_runtime_dep, threads_dep],
 )
