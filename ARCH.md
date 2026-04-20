@@ -2,174 +2,242 @@
 
 ## Overview
 
-`rpc-bench` measures the performance of a remote key-value service implemented
-with Cap'n Proto RPC. The observable system consists of:
+`rpc-bench` measures one simple remote service: a unary RPC whose result is the
+CRC32 hash of a request payload. The observable system consists of:
 
-- A key-value RPC interface with `Get`, `Put`, and `Delete`.
-- A server executable that exposes exactly one shard on exactly one endpoint.
-- A benchmark executable that can either connect to one existing endpoint or
-  spawn one local server process.
-- A reporting layer that emits human-readable summaries and machine-readable
-  JSON for each benchmark run.
+- an internal `protocol` library shared by both executables
+- `rpc-bench-server`, a single-listen-target hash server
+- `rpc-bench-bench`, a benchmark driver that targets one server at a time
 
-The project is intentionally structured so the benchmark logic, reporting, and
-configuration parsing are reusable without committing to a persistent storage
-engine yet.
+The implementation is intentionally small and explicit. This version does not
+define persistence, sharding, multi-target runs, or multi-threaded server
+execution.
 
-## Behavioral Model
+An internal application layer owns CLI parsing and URI/mode policy. The bench
+and server runtime layers below it operate on async stream abstractions rather
+than on URI strings.
 
-### Key-value semantics
+## Service Semantics
 
-- Keys and values are opaque byte strings.
-- `Put` stores or replaces the value for a key.
-- `Get` returns `found=false` with an empty value when the key is absent.
-- `Get` returns `found=true` and the stored bytes when the key is present.
-- `Delete` removes the key if it exists and reports whether removal happened.
+### RPC method
 
-The v1 implementation uses an in-memory map. Restarting a server discards all
-data. Persistence and crash recovery are explicitly out of scope for this
-revision.
+The server exposes one internal Cap'n Proto interface:
 
-### Endpoint and thread model
+- `hash(payload :Data) -> (crc32 :UInt32)`
 
-Each server process owns a single event loop, a single Cap'n Proto listener,
-and a single in-memory shard. Each benchmark run targets exactly one endpoint.
+### Hashing rules
 
-This choice preserves three properties that matter for reproducible benchmarks:
+- The CRC32 uses the standard IEEE polynomial.
+- The hash is computed over the request payload bytes only.
+- A zero-length payload is valid.
+- The maximum permitted payload length is 1 MiB.
 
-- One Cap'n Proto EzRpc event loop is owned by one thread.
-- The benchmark never hides sharding behind a multi-endpoint run.
-- Remote and spawn-local runs share the same single-endpoint execution shape.
+### Invalid input handling
 
-All client threads talk to the same endpoint for the lifetime of a run. Every
-thread still owns a distinct logical key-space, so `Get` and `Delete`
-operations observe real key-value semantics without requiring cross-thread
-client sharing.
+- If a benchmark configuration requests payloads above 1 MiB, the CLI rejects
+  the run before it starts.
+- If a direct RPC caller submits a payload above 1 MiB, the server rejects the
+  call as an application or RPC failure.
+- If a session breaks during connect, request, or response handling, the
+  affected benchmark thread fails the run.
 
-The current server implementation is single-threaded and async. In spawn-local
-mode the benchmark can request `server_threads`, but the server warns and falls
-back to one effective server thread when a value greater than `1` is supplied.
-Connect mode does not allow the benchmark to configure remote server thread
-counts.
+## Transport Semantics
 
-## RPC Contract
+### Public URI surface
 
-The wire protocol is defined in `schemas/kv.capnp`.
+The user-visible transport identifier is always a URI.
 
-- `Get(key)` returns `found` and `value`.
-- `Put(key, value)` stores bytes and returns no payload.
-- `Delete(key)` returns `found`.
+Supported URI kinds:
 
-The benchmark relies on this interface being stable. Any future reimplementation
-in another language must preserve request and response semantics exactly if it
-claims wire compatibility with this version.
+- `tcp://HOST:PORT`
+- `unix:///absolute/path`
+- `pipe://socketpair`
 
-## Benchmark Model
+### Transport boundary
 
-### Load generation
+- The application layer parses URIs and benchmark/server mode policy.
+- The transport layer turns those URI policies into listener setup,
+  spawn-local process wiring, and async stream openers.
+- The bench and server runtime layers consume only async stream-backed RPC
+  sessions and do not parse or branch on URI strings.
 
-The benchmark uses a bounded in-flight model:
+### Mode restrictions
 
-- Each client thread owns one EzRpc client and one event loop.
-- Each client thread maintains up to `queue_depth` outstanding RPC chains.
-- As soon as one request completes, the same chain issues the next request
-  until the phase deadline is reached.
+- `connect` is defined for `tcp://...` and `unix://...`
+- `spawn-local` is defined for `tcp://...`, `unix://...`, and
+  `pipe://socketpair`
+- `pipe://socketpair` remains `spawn-local` only because it depends on
+  inherited pre-connected file descriptors
 
-This is a closed-loop workload. Throughput therefore reflects service time,
-network time, queue depth, and client backpressure together.
+## Server Semantics
+
+### Runtime model
+
+- One server process owns one KJ async event loop.
+- Every accepted or pre-created session is serviced through one
+  `TwoPartyVatNetwork` plus one `RpcSystem`.
+- The server exports one bootstrap capability that implements the hash RPC.
+- The server remains single-threaded in this milestone.
+
+### Transport-specific session setup
+
+- For `tcp://...` and `unix://...`, the server resolves the URI through KJ,
+  binds one listener, and accepts streams from that listener.
+- For `pipe://socketpair`, the benchmark parent creates one socketpair per
+  logical client connection before spawning the child server. The child wraps
+  the inherited server ends into KJ streams and serves them as pre-connected
+  RPC sessions.
+
+### Server thread policy
+
+- The public CLI keeps `--server-threads=N`.
+- The benchmark rejects `--server-threads` in `connect` mode because it cannot
+  configure an already-running server.
+- The server process itself rejects values greater than `1`. The benchmark does
+  not pre-empt that spawn-local failure.
+
+### Lifecycle
+
+- In spawn-local mode the server completes its transport-specific startup before
+  notifying the benchmark parent through a ready pipe.
+- Unless `--quiet` is set, the server prints one startup banner with the bound
+  URI.
+- `SIGINT` and `SIGTERM` are captured through KJ's Unix event port and cancel
+  server work from within the event loop.
+- After shutdown is requested, the process exits the event loop and terminates.
+
+## Benchmark Semantics
+
+### Run modes
+
+- `connect` benchmarks one already running server over `tcp://...` or
+  `unix://...`
+- `spawn-local` starts one local `rpc-bench-server` child, waits for startup
+  readiness, runs the workload, and then stops the child
+
+Every benchmark invocation targets exactly one URI.
+
+### Spawn-local transport setup
+
+- For `tcp://...` and `unix://...`, the benchmark passes `--listen-uri=URI` to
+  the child and waits for a startup-ready signal.
+- For `pipe://socketpair`, the benchmark creates one socketpair per logical
+  client connection, inherits the server ends into the child, and keeps the
+  parent ends for the benchmark runtime.
+
+### Client concurrency model
+
+- `client_threads` means the number of benchmark event-loop threads.
+- Each thread owns one KJ event loop.
+- `client_connections` means the total number of RPC sessions opened for the
+  run.
+- Connections are distributed as evenly as possible across the configured
+  threads. Some threads may host zero connections.
+- Each connection keeps exactly one request outstanding at a time.
+- This is a closed-loop benchmark. A connection sends the next RPC only after
+  the previous reply arrives.
 
 ### Workload contents
 
-The workload is defined by:
+- Request payload sizes are sampled uniformly from an inclusive size range.
+- The default range is `128-256` bytes.
+- Payload contents are generated from a deterministic PRNG stream derived from
+  the configured seed and the logical connection index.
+- Each invocation has one warmup phase and one measured phase.
+- Warmup traffic is not included in the reported statistics.
 
-- Client thread-count sweep.
-- Queue-depth sweep.
-- Key-size sweep.
-- Value-size sweep.
-- One or more operation mixes expressed as `get:put:delete` percentages.
-- Warmup duration.
-- Measured duration.
-- Iteration count.
-- Seed and key-space size.
+## Reporting Semantics
 
-Spawn-local mode also accepts one requested server-thread count. That setting
-is not a sweep in this version, and the current implementation always executes
-with one effective server thread after any required fallback.
+### Counted traffic
 
-Each iteration begins with a prefill stage that inserts the thread-local
-key-space for every participating client thread. Prefill is not counted toward
-reported throughput or latency.
+The report intentionally preserves the legacy logical byte accounting that
+predates the Cap'n Proto transport change.
 
-### Reporting
+- `requestBytes` counts `4 + payload_size` for each successful measured RPC.
+- `responseBytes` counts `4` for each successful measured RPC.
 
-For every matrix point and iteration the benchmark reports:
+These counters are compatibility-oriented metrics, not literal Cap'n Proto wire
+bytes.
 
-- Effective server thread count.
-- Endpoint used for the run.
-- Total operation count.
-- Per-operation counts for get, put, and delete.
-- Found and missing get counts.
-- Removed and missing delete counts.
-- Error count.
-- Request and response payload bytes.
-- Operations per second.
-- MiB per second.
-- Latency min, p50, p90, p99, and max.
+### Latency
 
-The text report is intended for terminals and quick inspection. The JSON report
-is intended for automation and later comparison tooling.
+- Latency is round-trip time from the start of request submission until the RPC
+  reply has been received completely.
+- Reported percentiles are `p50`, `p75`, `p90`, `p99`, and `p99.9`.
+- Percentiles are computed from successful measured requests only.
+
+### Throughput
+
+- Request throughput is `requestBytes / measuredSeconds`.
+- Response throughput is `responseBytes / measuredSeconds`.
+- Combined throughput is `(requestBytes + responseBytes) / measuredSeconds`.
+- Request-rate throughput is `totalRequests / measuredSeconds`.
+
+The benchmark emits both a terminal summary and an optional JSON document with
+the same core fields.
 
 ## Implementation Structure
 
-The codebase is split into an internal core library plus runnable frontends:
+- `src/protocol/`: schema generation, payload-limit validation, and CRC32
+  implementation
+- `src/app/`: CLI parsing and top-level orchestration
+- `src/transport/`: URI parsing, spawn-local wiring, listener setup, and
+  stream session plumbing
+- `src/server/`: bootstrap capability implementation
+- `src/bench/`: benchmark runtime, workload generation, and report rendering
 
-- `config`: CLI parsing, validation, and usage text.
-- `storage`: key-value abstractions and the in-memory backend.
-- `rpc`: Cap'n Proto service implementation and server runner.
-- `metrics`: benchmark result types plus text and JSON formatting.
-- `bench`: workload execution, local process spawning, remote connection logic,
-  and metric aggregation.
-
-The core library is internal-only in this version. Headers live under
-`include/rpcbench/` for code organization, but the project does not install a
-public SDK or guarantee downstream source compatibility yet.
+The protocol layer is internal-only. This repository does not expose or install
+a public SDK surface in this version.
 
 ## Design Decisions And Trade-offs
 
-### Why EzRpc first
+### Why keep every server transport on one KJ event loop
 
-EzRpc gives a correct and compact Cap'n Proto server/client integration point
-for the first benchmarkable version. The trade-off is that transport control is
-less flexible than lower-level two-party RPC APIs.
+The benchmark is intended to compare transport paths without changing the basic
+server execution model. Keeping all transports on one KJ event loop removes a
+major source of runtime variation and keeps shutdown behavior consistent.
 
-### Why explicit Meson source lists
+### Why keep the runtime stream-only
 
-Meson does not treat wildcard source discovery as a primary model. Explicit
-source lists keep the build graph reviewable and make generated-code edges
-obvious.
+The user-facing architecture goal for this milestone is that bench and server
+runtime code should talk in terms of KJ async streams rather than in terms of
+transport-specific URI branching. The trade-off is that the application and
+transport layers must carry a little more setup logic.
 
-### Why single-endpoint runs for now
+### Why use `TwoPartyVatNetwork` plus `RpcSystem`
 
-Single-endpoint runs keep ownership boundaries simple:
+Using the same RPC plumbing for every stream-backed transport keeps the hash
+service implementation transport-agnostic. The trade-off is that even local
+pipe-based runs still speak Cap'n Proto RPC messages internally.
 
-- One process owns one event loop.
-- The benchmark result shape stays aligned with what actually executed.
-- Remote deployment stays a first-class path without hidden sharding behavior.
+### Why `pipe://socketpair` is spawn-local only
 
-The trade-off is that the benchmark does not yet model multi-endpoint or
-multi-threaded server execution. The `server_threads` flag exists to reserve
-the future interface, but values above `1` currently warn and fall back to the
-single-threaded async server.
+`pipe://socketpair` depends on benchmark-owned process setup:
 
-## Future Work
+- `pipe://socketpair` requires inherited pre-connected descriptors
 
-The architecture intentionally leaves room for:
+Restricting it to spawn-local mode keeps the public CLI simple and avoids
+defining an external descriptor handoff protocol.
 
-- Persistent storage engines.
-- Richer workload policies and open-loop traffic generation.
-- Cross-host orchestration helpers.
-- A real multi-threaded server implementation behind `server_threads`.
-- Additional RPC methods, such as batched operations or range scans.
+### Why keep one outstanding request per connection
 
-Any future change that alters wire semantics, sharding semantics, report
-semantics, or lifecycle expectations must update this file.
+One in-flight request per connection keeps RTT semantics unambiguous while
+still allowing concurrency through multiple connections per event-loop thread.
+The trade-off is that this version does not explore per-connection pipelining
+or open-loop traffic generation.
+
+### Why preserve legacy byte counters
+
+The transport changed, but the terminal and JSON report fields remain stable so
+existing users can compare runs without a report-schema migration. The
+trade-off is that `requestBytes` and `responseBytes` are logical compatibility
+metrics rather than literal on-the-wire Cap'n Proto sizes.
+
+## Non-goals For This Milestone
+
+- multi-threaded server execution
+- multiple targets in one benchmark invocation
+- persistence or recovery semantics
+- any shared-memory transport
+- remote or non-POSIX variants of `pipe://socketpair`
+- a public reusable client or server SDK

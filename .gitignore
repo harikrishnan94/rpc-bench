@@ -6,8 +6,6 @@ builddir-coverage/
 out/
 compile_commands.json
 native/*.ini
-subprojects/*
-!subprojects/*.wrap
 
 # IDE/editor noise
 .vscode/

@@ -51,6 +51,10 @@ def locate_target_output(build_dir: Path, name: str) -> Path:
     raise RuntimeError(f"Could not locate output for Meson target '{name}'")
 
 
+def locate_target_outputs(build_dir: Path, names: list[str]) -> list[Path]:
+    return [locate_target_output(build_dir, name) for name in names]
+
+
 def locate_test_binaries(build_dir: Path) -> list[Path]:
     tests = json.loads(capture(["meson", "introspect", str(build_dir), "--tests"]))
     binaries: list[Path] = []
@@ -166,9 +170,20 @@ def main() -> int:
 
     test_binaries = locate_test_binaries(coverage_build_dir)
     primary_binary = test_binaries[0]
-    library_binary = locate_target_output(coverage_build_dir, "rpc_bench_core")
-    extra_objects = [library_binary, *test_binaries[1:]]
-    ignore_regex = ".*/(subprojects|tests)/.*"
+    extra_objects = locate_target_outputs(
+        coverage_build_dir,
+        [
+            "rpcbench_protocol",
+            "rpcbench_bench_runtime",
+            "rpcbench_server_runtime",
+            "rpcbench_transport",
+            "rpcbench_app",
+            "rpc-bench-bench",
+            "rpc-bench-server",
+        ],
+    )
+    extra_objects.extend(test_binaries[1:])
+    ignore_regex = ".*/tests/.*"
 
     report_cmd = [
         llvm_cov,

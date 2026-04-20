@@ -1,26 +1,34 @@
 # rpc-bench
 
-`rpc-bench` is a Cap'n Proto RPC benchmark for a key-value service. The project
-builds a standalone server plus a benchmark driver that measures achievable
-transactions per second, latency percentiles, and payload bandwidth across
-different client thread counts, queue depths, payload sizes, and one
-single-endpoint server configuration.
+`rpc-bench` is a CRC32 RPC benchmark built on Cap'n Proto and KJ. The
+repository builds:
 
-## Status
+- an internal-only protocol/schema library
+- `rpc-bench-server`
+- `rpc-bench-bench`
 
-The current bootstrap implements:
+The current implementation keeps one Cap'n Proto RPC contract and one KJ event
+loop on the server for every supported transport. An internal application layer
+parses CLI URIs and run modes, while the bench and server runtime layers talk
+only in terms of async stream-backed RPC sessions.
 
-- A real in-memory key-value backend.
-- A Cap'n Proto RPC schema plus generated-code build wiring.
-- `rpc-bench-server`, which serves a single shard on one endpoint.
-- `rpc-bench-bench`, which runs remote or local-spawn benchmark runs against
-  one endpoint and emits text plus JSON reports.
-- `rpc-bench-tests`, which covers parsing, metrics, storage, and a loopback
-  benchmark integration path.
+## System Prerequisites
 
-Persistence, replication, and richer workload policies are intentionally out of
-scope for this first version. Those behaviors are described in
-`ARCH.md` as future extension points rather than implemented features.
+`rpc-bench` depends on a system-installed Cap'n Proto toolchain. Meson looks
+for:
+
+- `capnp` on `PATH`
+- `capnpc-c++` on `PATH`
+- pkg-config-visible `capnp`, `capnp-rpc`, `kj`, and `kj-async`
+
+Common installation routes:
+
+- `brew install capnp`
+- `apt-get install capnproto`
+- `pacman -S capnproto`
+
+If Cap'n Proto is already installed but Meson cannot find it, expose the tools
+through `PATH` and the pkg-config metadata through `PKG_CONFIG_PATH`.
 
 ## Build
 
@@ -31,12 +39,9 @@ meson setup builddir --native-file native/clang22-debug.ini
 meson compile -C builddir
 ```
 
-The first configure downloads Cap'n Proto from the official source release via
-the custom wrap in `subprojects/`.
-
 ## Test
 
-Run the unit and integration tests with Meson:
+Run the automated test suite with Meson:
 
 ```sh
 meson test -C builddir --print-errorlogs
@@ -55,67 +60,162 @@ HTML report:
 meson compile -C builddir coverage-report
 ```
 
-## Binaries
+## Service Contract
 
-### `rpc-bench-server`
+The service exposes one unary Cap'n Proto RPC:
 
-The server binds one endpoint and serves one in-memory shard:
+- `hash(payload :Data) -> (crc32 :UInt32)`
+
+Behavior:
+
+- the CRC32 uses the standard IEEE polynomial
+- the hash is computed over the payload bytes only
+- zero-length payloads are valid
+- the maximum payload size is 1 MiB
+
+Oversized direct RPC calls fail as application/RPC errors rather than being
+silently truncated.
+
+## URI Surface
+
+The public CLI is URI-first.
+
+Supported listen or connect URIs:
+
+- `tcp://HOST:PORT`
+- `unix:///absolute/path`
+- `pipe://socketpair`
+
+Transport restrictions:
+
+- `connect` supports `tcp://...` and `unix://...`
+- `spawn-local` supports `tcp://...`, `unix://...`, and `pipe://socketpair`
+- `pipe://socketpair` remains `spawn-local` only because it requires inherited
+  file descriptors
+
+## `rpc-bench-server`
+
+The server owns one KJ event loop for every transport and serves one bootstrap
+capability over Cap'n Proto two-party RPC.
+
+Example:
 
 ```sh
-./builddir/src/rpc-bench-server --listen-host=127.0.0.1 --port=7000
+./builddir/src/rpc-bench-server \
+  --listen-uri=tcp://127.0.0.1:7000 \
+  --server-threads=1
 ```
 
-Important notes:
+Unix-domain example:
 
-- Each server process owns one event loop and one shard.
-- `--server-threads` accepts values above `1`, but the server warns and falls
-  back to the current single-threaded async implementation.
-- The server does not persist data across restarts in this version.
+```sh
+./builddir/src/rpc-bench-server \
+  --listen-uri=unix:///tmp/rpc-bench.sock \
+  --server-threads=1
+```
 
-### `rpc-bench-bench`
+`pipe://socketpair` is intended for `spawn-local` mode, where the benchmark
+process supplies the inherited descriptors for the child server automatically.
 
-The benchmark runner supports two modes:
+The server accepts `--server-threads=N`, but the current runtime is still
+single-threaded and rejects values greater than `1`.
 
-- `connect`: connect to one already running server endpoint.
-- `spawn-local`: launch one local `rpc-bench-server` process automatically.
+Use `--quiet` to suppress the startup banner while keeping warnings and errors
+on `stderr`.
 
-Example local run:
+## `rpc-bench-bench`
+
+The benchmark keeps two run modes:
+
+- `spawn-local`: launch one local `rpc-bench-server` child process
+- `connect`: benchmark one already running server
+
+Each benchmark run uses:
+
+- `client_threads`: the number of benchmark event-loop threads
+- `client_connections`: the total number of RPC connections
+- connections distributed as evenly as possible across those threads
+- zero or more connections per thread, so idle threads are allowed
+- one outstanding request per connection at a time
+- one warmup phase and one measured phase
+- per-request payload sizes sampled uniformly from an inclusive range
+
+Example `spawn-local` TCP run:
 
 ```sh
 ./builddir/src/rpc-bench-bench \
   --mode=spawn-local \
-  --server-port=7300 \
+  --listen-uri=tcp://127.0.0.1:7300 \
   --server-threads=1 \
-  --client-threads=1,2,4,8 \
-  --queue-depths=1,8,32 \
-  --key-sizes=16 \
-  --value-sizes=128,1024 \
-  --mixes=80:19:1,50:50:0 \
+  --client-threads=2 \
+  --client-connections=4 \
+  --message-size-min=128 \
+  --message-size-max=256 \
   --warmup-seconds=0.5 \
-  --measure-seconds=1.5 \
-  --iterations=2 \
-  --json-output=report.json
+  --measure-seconds=2.0 \
+  --seed=1 \
+  --json-output=report.json \
+  --quiet-server
 ```
 
-If `spawn-local` receives `--server-threads` greater than `1`, the server warns
-to `stderr` and defaults to the current single-threaded async server.
-
-Example remote run against one endpoint:
+Example `connect` Unix-domain run:
 
 ```sh
 ./builddir/src/rpc-bench-bench \
   --mode=connect \
-  --endpoint=127.0.0.1:7000 \
-  --client-threads=4,8 \
-  --queue-depths=8,32 \
-  --key-sizes=16 \
-  --value-sizes=512 \
-  --mixes=90:10:0
+  --connect-uri=unix:///tmp/rpc-bench.sock \
+  --client-threads=2 \
+  --client-connections=4 \
+  --message-size-min=128 \
+  --message-size-max=256 \
+  --warmup-seconds=0.5 \
+  --measure-seconds=2.0 \
+  --seed=1
 ```
 
-## Adding Files
+Example `spawn-local` pipe run:
 
-Meson source lists are explicit by design. Adding new `.cpp`, `.hpp`, or
-`.capnp` files will require updating the relevant `meson.build` file. This
-keeps the build graph auditable and matches Meson's documented source-discovery
-model.
+```sh
+./builddir/src/rpc-bench-bench \
+  --mode=spawn-local \
+  --listen-uri=pipe://socketpair \
+  --server-threads=1 \
+  --client-threads=2 \
+  --client-connections=4 \
+  --message-size-min=128 \
+  --message-size-max=256 \
+  --warmup-seconds=0.5 \
+  --measure-seconds=2.0 \
+  --seed=1 \
+  --quiet-server
+```
+
+The default request-size range is `128-256` bytes when no size flags are
+provided.
+
+In `connect` mode the benchmark rejects `--server-threads`, because it cannot
+configure an already-running remote server.
+
+## Reporting
+
+The benchmark prints a terminal summary and can also emit JSON with
+`--json-output=PATH`.
+
+Both outputs keep the existing field names and include:
+
+- mode and endpoint
+- client thread count
+- client connection count
+- configured message-size range
+- total requests and error count
+- request bytes and response bytes
+- request, response, and combined throughput
+- RTT latency percentiles: `p50`, `p75`, `p90`, `p99`, `p99.9`
+
+The reported byte counters intentionally preserve the earlier logical framing
+accounting:
+
+- `requestBytes` counts `4 + payload_size` for each successful measured RPC
+- `responseBytes` counts `4` for each successful measured RPC
+
+These are compatibility-oriented metrics, not literal Cap'n Proto wire bytes.

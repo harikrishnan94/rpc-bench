@@ -8,67 +8,79 @@ project(
   ],
 )
 
-cmake = import('cmake')
 python = import('python').find_installation(required : true)
 
-project_inc = include_directories('include')
-generated_inc = include_directories('.')
-schema_source_dir = join_paths(meson.project_source_root(), 'schemas')
+capnp_prog = find_program('capnp', required : false)
+capnpc_cpp_prog = find_program('capnpc-c++', required : false)
+pkg_config_prog = find_program('pkg-config', required : false)
 
-capnp_opts = cmake.subproject_options()
-capnp_opts.set_install(false)
-capnp_opts.add_cmake_defines({
-  'BUILD_TESTING' : false,
-  'BUILD_SHARED_LIBS' : false,
-  'WITH_OPENSSL' : 'OFF',
-  'WITH_ZLIB' : 'OFF',
-  'WITH_FIBERS' : 'OFF',
-})
-
-capnp_sp = cmake.subproject('capnproto', options : capnp_opts)
-
-capnp_dep = capnp_sp.dependency('capnp')
-capnp_rpc_dep = capnp_sp.dependency('capnp-rpc')
-kj_dep = capnp_sp.dependency('kj')
-kj_async_dep = capnp_sp.dependency('kj-async')
-
-capnp_tool = capnp_sp.target('capnp_tool')
-capnpc_cpp = capnp_sp.target('capnpc_cpp')
-
-kv_schema = custom_target(
-  'kv_schema',
-  input : files('schemas/kv.capnp'),
-  output : [
-    'kv.capnp.h',
-    'kv.capnp.c++',
-  ],
-  command : [
-    capnp_tool,
-    'compile',
-    '-o',
-    capnpc_cpp.full_path() + ':@OUTDIR@',
-    '--src-prefix',
-    schema_source_dir,
-    '-I',
-    schema_source_dir,
-    '@INPUT@',
-  ],
-  depends : [capnpc_cpp],
+capnp_dep = dependency(
+  'capnp',
+  method : 'pkg-config',
+  allow_fallback : false,
+  required : false,
 )
-
-rpc_bench_schema = static_library(
-  'rpc_bench_schema',
-  kv_schema,
-  include_directories : [generated_inc],
-  dependencies : [capnp_dep, kj_dep],
+capnp_rpc_dep = dependency(
+  'capnp-rpc',
+  method : 'pkg-config',
+  allow_fallback : false,
+  required : false,
 )
-
-rpc_bench_schema_dep = declare_dependency(
-  link_with : rpc_bench_schema,
-  include_directories : [generated_inc],
-  sources : kv_schema,
-  dependencies : [capnp_dep, kj_dep],
+kj_dep = dependency(
+  'kj',
+  method : 'pkg-config',
+  allow_fallback : false,
+  required : false,
 )
+kj_async_dep = dependency(
+  'kj-async',
+  method : 'pkg-config',
+  allow_fallback : false,
+  required : false,
+)
+threads_dep = dependency('threads')
+
+capnp_missing = []
+if not capnp_prog.found()
+  capnp_missing += ['- missing `capnp` on `PATH`']
+endif
+if not capnpc_cpp_prog.found()
+  capnp_missing += ['- missing `capnpc-c++` on `PATH`']
+endif
+if not pkg_config_prog.found()
+  capnp_missing += ['- missing `pkg-config` on `PATH`']
+endif
+if not capnp_dep.found()
+  capnp_missing += ['- missing pkg-config dependency `capnp`']
+endif
+if not capnp_rpc_dep.found()
+  capnp_missing += ['- missing pkg-config dependency `capnp-rpc`']
+endif
+if not kj_dep.found()
+  capnp_missing += ['- missing pkg-config dependency `kj`']
+endif
+if not kj_async_dep.found()
+  capnp_missing += ['- missing pkg-config dependency `kj-async`']
+endif
+
+if capnp_missing.length() > 0
+  error(
+    'Cap\'n Proto system toolchain is required for rpc-bench.\n'
+    + 'Missing items:\n'
+    + '\n'.join(capnp_missing)
+    + '\n\n'
+    + 'The build needs system-installed `capnp`, `capnpc-c++`, and pkg-config-visible\n'
+    + '`capnp`, `capnp-rpc`, `kj`, and `kj-async`.\n\n'
+    + 'If Cap\'n Proto is already installed, expose it through `PATH` and `PKG_CONFIG_PATH`\n'
+    + 'before running Meson again.\n\n'
+    + 'If it is not installed yet, follow the official install guide. Common examples:\n'
+    + '  brew install capnp\n'
+    + '  apt-get install capnproto\n'
+    + '  pacman -S capnproto\n'
+  )
+endif
+
+capnp_include_dir = capnp_dep.get_variable(pkgconfig : 'includedir')
 
 subdir('src')
 subdir('tests')
