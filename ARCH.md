@@ -13,6 +13,9 @@ The implementation is intentionally small and explicit. This version does not
 define persistence, sharding, multi-target runs, or multi-threaded server
 execution.
 
+An internal `src/transport/` module owns URI parsing, session setup, and the
+transport runtime policy shared by the benchmark and server frontends.
+
 ## Service Semantics
 
 ### RPC method
@@ -55,15 +58,18 @@ Supported URI kinds:
 - `tcp://...` uses KJ `NetworkAddress` and `ConnectionReceiver`.
 - `unix://...` uses KJ `NetworkAddress` and `ConnectionReceiver`.
 - `pipe://socketpair` uses one pre-connected stream per worker.
-- `shm://NAME` uses shared-memory request and response rings plus a control
-  socket for init and wake notifications.
+- `shm://NAME` uses a server-owned shared-memory region for request and
+  response rings plus a derived Unix-socket sidecar rendezvous path for attach,
+  init, and wake notifications.
 
 ### Mode restrictions
 
-- `connect` is defined only for `tcp://...` and `unix://...`.
+- `connect` is defined for `tcp://...`, `unix://...`, and `shm://NAME`.
 - `spawn-local` is defined for all supported URI kinds.
-- `pipe://socketpair` and `shm://NAME` are local-only transports in this
-  milestone.
+- `pipe://socketpair` remains `spawn-local` only because it depends on
+  inherited pre-connected file descriptors.
+- `shm://NAME` is local-only in transport implementation, but it supports both
+  `connect` and `spawn-local`.
 
 ## Server Semantics
 
@@ -84,10 +90,12 @@ Supported URI kinds:
 - For `pipe://socketpair`, the benchmark parent creates one socketpair per
   worker before spawning the child server. The child wraps the inherited server
   ends into KJ streams and serves them as pre-connected RPC sessions.
-- For `shm://NAME`, the benchmark parent creates the shared-memory region and a
-  control socket before spawning the child server. The child maps the region,
-  creates one `ShmMessageStream` per slot, and runs a KJ task on the control
-  socket to receive init and wake messages.
+- For `shm://NAME`, the server creates the named shared-memory region and
+  listens on the derived Unix-socket sidecar path. Each benchmark run connects
+  through that sidecar, announces its active slot count, and then establishes
+  one `ShmMessageStream` per active slot.
+- When `--listen-uri=shm://NAME` is used, the server requires
+  `--shm-slot-count=N` so the shared-memory layout has a fixed slot capacity.
 
 ### Lifecycle
 
@@ -103,12 +111,16 @@ Supported URI kinds:
 
 ### Run modes
 
-- `connect` benchmarks one already running server over `tcp://...` or
-  `unix://...`.
+- `connect` benchmarks one already running server over `tcp://...`,
+  `unix://...`, or `shm://NAME`.
 - `spawn-local` starts one local `rpc-bench-server` child, waits for startup
   readiness, runs the workload, and then stops the child.
 
 Every benchmark invocation targets exactly one URI.
+
+The benchmark CLI keeps separate `--connect-uri` and `--listen-uri` flags so
+the selected run mode still determines whether it attaches to an existing
+server or spawns one local child.
 
 ### Spawn-local transport setup
 
@@ -117,10 +129,10 @@ Every benchmark invocation targets exactly one URI.
 - For `pipe://socketpair`, the benchmark creates one socketpair per worker,
   inherits the server ends into the child, and keeps the parent ends for the
   worker threads.
-- For `shm://NAME`, the benchmark creates one shared-memory region with one slot
-  per worker, starts a parent-side broker thread for control-socket reads,
-  sends one init control frame per slot, waits for the child to acknowledge
-  startup readiness, and then runs the workload.
+- For `shm://NAME`, the benchmark passes `--listen-uri=shm://NAME` and
+  `--shm-slot-count=client_threads` to the child, waits for startup readiness,
+  connects to the derived Unix-socket sidecar, and then attaches one worker
+  slot per client thread.
 
 ### Client concurrency model
 
@@ -173,12 +185,13 @@ the same core fields.
 
 ## Implementation Structure
 
-- `src/protocol/`: schema generation, payload-limit validation, URI parsing,
-  CRC32 implementation, and the shared-memory transport helpers
-- `src/server/`: CLI parsing, transport-specific server startup, session setup,
-  and bootstrap capability wiring
-- `src/bench/`: CLI parsing, child-process management, spawn-local transport
-  setup, workload generation, RPC client loops, and report rendering
+- `src/protocol/`: schema generation, payload-limit validation, and CRC32
+  implementation
+- `src/transport/`: URI parsing, session setup, KJ listener/runtime plumbing,
+  spawn-local transport orchestration, and shared-memory helpers
+- `src/server/`: CLI parsing and bootstrap capability wiring
+- `src/bench/`: CLI parsing, workload generation, RPC client loops, and report
+  rendering
 
 The protocol layer is internal-only. This repository does not expose or install
 a public SDK surface in this version.
@@ -198,22 +211,21 @@ message-stream transports keeps the hash service implementation transport-agnost
 The trade-off is that even the local-only transports still speak Cap'n Proto RPC
 messages internally rather than a smaller custom protocol.
 
-### Why `pipe://socketpair` and `shm://NAME` are spawn-local only
+### Why `pipe://socketpair` is spawn-local only
 
-Both transports depend on benchmark-owned process setup:
+`pipe://socketpair` depends on benchmark-owned process setup:
 
 - `pipe://socketpair` requires inherited pre-connected descriptors
-- `shm://NAME` requires shared-memory creation plus control-socket coordination
 
-Restricting them to spawn-local mode keeps the public CLI simple and avoids
-defining a separate external rendezvous protocol for local-only transports.
+Restricting it to spawn-local mode keeps the public CLI simple and avoids
+defining an external descriptor handoff protocol.
 
 ### Why shared memory stays hybrid instead of pure polling
 
 The shared-memory transport moves message bytes through rings, but it still uses
-a control socket for init and wake notifications. That keeps the server driven
-by the KJ event loop instead of introducing a non-KJ polling loop just for
-shared memory.
+a derived Unix-socket sidecar for attach, init, and wake notifications. That
+keeps the server driven by the KJ event loop instead of introducing a non-KJ
+polling loop just for shared memory.
 
 ### Why keep one outstanding request per worker
 

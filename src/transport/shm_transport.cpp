@@ -1,9 +1,11 @@
 // Shared-memory transport helpers for the hybrid Cap'n Proto MessageStream
 // path. The implementation keeps the mapped ring layout, wake primitives, and
-// control-socket framing self-contained so the benchmark and server can wire
-// them in later without forcing build-system or CLI churn in this patch.
+// control-socket framing self-contained so connect-mode and spawn-local shared
+// memory reuse one transport protocol.
 
-#include "protocol/shm_transport.hpp"
+#include "transport/shm_transport.hpp"
+
+#include "protocol/service.hpp"
 
 #include <algorithm>
 #include <array>
@@ -61,6 +63,8 @@ namespace {
 inline constexpr std::array<char, 8> kShmMagic = {'r', 'p', 'c', 'b', 's', 'h', 'm', '1'};
 inline constexpr std::uint32_t kShmVersion = 1;
 inline constexpr std::size_t kRingHeaderAlignment = 64;
+inline constexpr std::size_t kDefaultRingCapacity = 8;
+inline constexpr std::size_t kDefaultMessageSlackBytes = 64U * 1024U;
 
 struct RingLayout {
   std::size_t slot_stride_bytes = 0;
@@ -398,6 +402,8 @@ signal_control_message(std::span<Listener*> listeners, const ControlMessage& mes
   case ControlMessageKind::wake:
     listener->signal();
     return {};
+  case ControlMessageKind::attach:
+    return std::unexpected("attach control messages are only valid on the server side");
   }
 
   return std::unexpected(
@@ -459,6 +465,18 @@ std::expected<void, std::string> ShmTransportOptions::validate() const {
     return std::unexpected("response max message size exceeds uint32_t limits");
   }
   return {};
+}
+
+ShmTransportOptions default_shm_transport_options(std::size_t slot_count) {
+  return ShmTransportOptions{
+      .slot_count = slot_count,
+      .request_ring_capacity = kDefaultRingCapacity,
+      .response_ring_capacity = kDefaultRingCapacity,
+      .request_max_message_bytes =
+          static_cast<std::size_t>(kMaxPayloadSizeBytes) + kDefaultMessageSlackBytes,
+      .response_max_message_bytes =
+          static_cast<std::size_t>(kMaxPayloadSizeBytes) + kDefaultMessageSlackBytes,
+  };
 }
 
 ShmMessageRingView::ShmMessageRingView(detail::ShmRingHeader* header, std::byte* slots) noexcept
@@ -994,6 +1012,10 @@ void CrossThreadWakeListener::signal() {
   waiter->fulfill();
 }
 
+std::expected<void, std::string> ControlMessageSender::send_attach(std::size_t slot_count) {
+  return send(ControlMessageKind::attach, slot_count);
+}
+
 std::expected<void, std::string> ControlMessageSender::send_init(std::size_t slot_index) {
   return send(ControlMessageKind::init, slot_index);
 }
@@ -1166,6 +1188,10 @@ kj::Promise<void> ServerControlDispatcher::initialized() {
   return init_ready_.addBranch();
 }
 
+std::size_t ServerControlDispatcher::active_slot_count() const {
+  return active_slot_count_;
+}
+
 kj::Promise<void> ServerControlDispatcher::pump_one() {
   return stream_.read(&read_buffer_, sizeof(read_buffer_))
       .then(
@@ -1188,7 +1214,42 @@ kj::Promise<void> ServerControlDispatcher::pump_one() {
 
 std::expected<void, std::string>
 ServerControlDispatcher::handle_message(const ControlMessage& message) {
-  auto signal_result = signal_control_message(std::span(listeners_), message);
+  if (message.kind == ControlMessageKind::attach) {
+    if (attach_seen_) {
+      return std::unexpected("shared-memory transport received duplicate attach message");
+    }
+
+    const auto announced_slots = static_cast<std::size_t>(message.slot_index);
+    if (announced_slots == 0) {
+      return std::unexpected("shared-memory attach message must announce at least one slot");
+    }
+    if (announced_slots > listeners_.size()) {
+      return std::unexpected(
+          std::format("shared-memory attach announced {} slots but the server only provisioned {}",
+                      announced_slots,
+                      listeners_.size()));
+    }
+
+    attach_seen_ = true;
+    active_slot_count_ = announced_slots;
+    if (init_count_ == active_slot_count_ && init_fulfiller_.get() != nullptr) {
+      auto fulfiller = kj::mv(init_fulfiller_);
+      fulfiller->fulfill();
+    }
+    return {};
+  }
+
+  if (!attach_seen_) {
+    return std::unexpected("shared-memory control message arrived before the attach handshake");
+  }
+
+  const auto slot_index = static_cast<std::size_t>(message.slot_index);
+  if (slot_index >= active_slot_count_) {
+    return std::unexpected(std::format("control message referenced inactive slot {}", slot_index));
+  }
+
+  auto signal_result =
+      signal_control_message(std::span(listeners_.data(), active_slot_count_), message);
   if (!signal_result) {
     return std::unexpected(signal_result.error());
   }
@@ -1198,7 +1259,7 @@ ServerControlDispatcher::handle_message(const ControlMessage& message) {
     if (init_seen_[slot_index] == 0) {
       init_seen_[slot_index] = 1;
       ++init_count_;
-      if (init_count_ == listeners_.size() && init_fulfiller_.get() != nullptr) {
+      if (init_count_ == active_slot_count_ && init_fulfiller_.get() != nullptr) {
         auto fulfiller = kj::mv(init_fulfiller_);
         fulfiller->fulfill();
       }

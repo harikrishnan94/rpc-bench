@@ -1,9 +1,11 @@
-// Shared protocol-side parsing and transport-URI utilities. These helpers keep
-// the server and benchmark frontends aligned on mode names, URI syntax, and
-// the hard payload-size contract.
+// Shared URI parsing and path-derivation helpers. Keeping them in the
+// transport layer lets the server, benchmark, and shared-memory sidecar logic
+// agree on one transport namespace without duplicating parsing rules.
 
-#include "protocol/common.hpp"
+#include "transport/uri.hpp"
 
+#include <cctype>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <limits>
@@ -93,17 +95,6 @@ std::expected<std::string, std::string> TransportUri::to_kj_address() const {
 
 bool TransportUri::uses_kj_network() const {
   return kind == TransportKind::tcp || kind == TransportKind::unix_socket;
-}
-
-std::expected<void, std::string> MessageSizeRange::validate() const {
-  if (min > max) {
-    return std::unexpected("message-size-min must be less than or equal to message-size-max");
-  }
-  if (max > kMaxPayloadSizeBytes) {
-    return std::unexpected(
-        std::format("message sizes must be less than or equal to {} bytes", kMaxPayloadSizeBytes));
-  }
-  return {};
 }
 
 std::expected<std::uint16_t, std::string> parse_port(std::string_view text, std::string_view name) {
@@ -200,6 +191,27 @@ std::filesystem::path sibling_binary_path(const std::filesystem::path& argv0,
   const auto absolute = std::filesystem::absolute(argv0, error);
   const auto parent = error ? argv0.parent_path() : absolute.parent_path();
   return parent / binary_name;
+}
+
+std::filesystem::path derived_shm_sidecar_path(std::string_view logical_name) {
+  std::string sanitized;
+  sanitized.reserve(logical_name.size());
+  for (const unsigned char ch : logical_name) {
+    if (std::isalnum(ch) || ch == '.' || ch == '-' || ch == '_') {
+      sanitized.push_back(static_cast<char>(ch));
+    } else {
+      sanitized.push_back('_');
+    }
+  }
+  if (sanitized.empty()) {
+    sanitized = "bench";
+  }
+
+  const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
+  const std::filesystem::path base_dir = runtime_dir != nullptr && runtime_dir[0] != '\0'
+                                             ? std::filesystem::path(runtime_dir)
+                                             : std::filesystem::path("/tmp");
+  return base_dir / std::format("rpc-bench-shm-{}.sock", sanitized);
 }
 
 std::string_view bench_mode_name(BenchMode mode) {

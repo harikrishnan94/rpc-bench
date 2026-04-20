@@ -1,10 +1,10 @@
 #pragma once
 
 // Benchmark frontend for the CRC32 RPC service. This layer owns CLI parsing,
-// spawn-local process management, workload generation, and report rendering for
-// one benchmark invocation.
+// workload generation, and report rendering, while the transport module owns
+// spawn-local process setup and per-worker channel attachment.
 
-#include "protocol/common.hpp"
+#include "transport/uri.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +16,20 @@
 #include <string_view>
 
 namespace rpcbench {
+
+inline constexpr std::size_t kDefaultMessageSizeMin = 128;
+inline constexpr std::size_t kDefaultMessageSizeMax = 256;
+
+struct MessageSizeRange {
+  // Inclusive lower and upper request-payload bounds in bytes. Zero-length
+  // payloads are allowed when explicitly requested, but the range may never
+  // exceed the service's 1 MiB payload limit.
+  std::size_t min = kDefaultMessageSizeMin;
+  std::size_t max = kDefaultMessageSizeMax;
+
+  // Validates ordering and the hard payload cap.
+  [[nodiscard]] std::expected<void, std::string> validate() const;
+};
 
 struct BenchConfig {
   // Selects whether the benchmark connects to one existing endpoint or starts

@@ -4,5 +4,5 @@ bench_exe = executable(
     'main.cpp',
     'benchmark.cpp',
   ),
-  dependencies : [rpcbench_protocol_dep],
+  dependencies : [rpcbench_transport_dep],
 )

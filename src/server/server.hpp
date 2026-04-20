@@ -1,10 +1,10 @@
 #pragma once
 
 // Server frontend for the CRC32 benchmark. This layer owns the CLI-facing
-// configuration and the blocking lifecycle around the single-threaded KJ event
-// loop that hosts the Cap'n Proto RPC listener.
+// configuration and hash-service bootstrap while the transport module owns the
+// blocking KJ event-loop lifecycle for each listen target.
 
-#include "protocol/common.hpp"
+#include "transport/uri.hpp"
 
 #include <cstdint>
 #include <expected>
@@ -33,8 +33,7 @@ struct ServerConfig {
   // Internal inherited server-side stream fds for pipe://socketpair.
   std::vector<int> preconnected_stream_fds;
 
-  // Internal control socket fd and slot count for shm://NAME.
-  std::optional<int> shm_control_fd;
+  // Fixed shared-memory slot capacity for shm://NAME.
   std::size_t shm_slot_count = 0;
 };
 

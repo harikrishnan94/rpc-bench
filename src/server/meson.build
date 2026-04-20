@@ -4,5 +4,5 @@ server_exe = executable(
     'main.cpp',
     'server.cpp',
   ),
-  dependencies : [rpcbench_protocol_dep],
+  dependencies : [rpcbench_protocol_dep, rpcbench_transport_dep],
 )

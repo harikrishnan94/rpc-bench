@@ -8,7 +8,9 @@ repository builds:
 - `rpc-bench-bench`
 
 The current implementation keeps one Cap'n Proto RPC contract and one KJ event
-loop on the server for every transport.
+loop on the server for every transport. An internal `src/transport/` module
+owns URI parsing, session setup, and transport runtime concerns shared by the
+benchmark and server frontends.
 
 ## System Prerequisites
 
@@ -66,9 +68,12 @@ Supported listen or connect URIs:
 
 Transport restrictions:
 
-- `connect` supports `tcp://...` and `unix://...`
+- `connect` supports `tcp://...`, `unix://...`, and `shm://NAME`
 - `spawn-local` supports all four URI kinds
-- `pipe://socketpair` and `shm://NAME` are local-only spawn-local transports
+- `pipe://socketpair` remains `spawn-local` only because it requires inherited
+  file descriptors
+- `shm://NAME` remains a local transport, but it supports both `connect` and
+  `spawn-local`
 
 ## `rpc-bench-server`
 
@@ -89,9 +94,14 @@ Unix-domain example:
   --listen-uri=unix:///tmp/rpc-bench.sock
 ```
 
-`pipe://socketpair` and `shm://NAME` are intended for `spawn-local` mode, where
-the benchmark process supplies the inherited descriptors and shared-memory setup
-for the child server automatically.
+`pipe://socketpair` is intended for `spawn-local` mode, where the benchmark
+process supplies the inherited descriptors for the child server automatically.
+
+The benchmark CLI still keeps split flags: `--connect-uri` for `connect` mode
+and `--listen-uri` for `spawn-local` mode.
+
+When `--listen-uri=shm://NAME` is used, the server also requires
+`--shm-slot-count=N` so it can size the shared-memory region up front.
 
 Use `--quiet` to suppress the startup banner while keeping warnings and errors
 on `stderr`.
@@ -146,6 +156,7 @@ Local transport examples:
 - `--listen-uri=unix:///tmp/rpc-bench.sock`
 - `--listen-uri=pipe://socketpair`
 - `--listen-uri=shm://bench`
+- `--connect-uri=shm://bench`
 
 The default request-size range is `128-256` bytes when no size flags are
 provided.
@@ -154,11 +165,15 @@ provided.
 
 `shm://NAME` is a hybrid transport:
 
+- the server creates the shared-memory region and sizes it with
+  `--shm-slot-count=N`
 - request and response message bytes move through shared-memory rings
-- each worker gets one logical slot
-- a control socket carries init and wake notifications
-- the server side stays on the KJ loop through that control socket instead of a
-  separate polling loop
+- each benchmark run attaches through a derived Unix-socket sidecar rendezvous
+  path
+- each worker gets one logical slot, and spawn-local fills the slot count from
+  `--client-threads`
+- the sidecar carries attach, init, and wake notifications so the server stays
+  on the KJ loop instead of a separate polling loop
 
 ## Reporting
 
@@ -191,7 +206,7 @@ This milestone keeps verification manual and Meson-based:
 - one `spawn-local` and one `connect` smoke run for `tcp://...`
 - one `spawn-local` and one `connect` smoke run for `unix://...`
 - one `spawn-local` smoke run for `pipe://socketpair`
-- one `spawn-local` smoke run for `shm://NAME`
+- one `spawn-local` and one `connect` smoke run for `shm://NAME`
 
 This repository does not keep repo-managed automated tests or a coverage target
 in this milestone.

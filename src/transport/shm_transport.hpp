@@ -1,10 +1,9 @@
 #pragma once
 
 // Shared-memory transport helpers for the hybrid Cap'n Proto MessageStream
-// path. This header keeps the transport primitives internal to the protocol
-// layer so the server and benchmark frontends can integrate shared-memory slots
-// and wake delivery without coupling URI or CLI policy into the transport
-// helpers themselves.
+// path. This header keeps the ring layout, wake primitives, and side-band
+// control framing inside the transport layer so frontends can reuse the same
+// local transport semantics in both connect and spawn-local modes.
 
 #include <atomic>
 #include <capnp/serialize-async.h>
@@ -44,6 +43,10 @@ struct ShmTransportOptions {
   // socket framing.
   [[nodiscard]] std::expected<void, std::string> validate() const;
 };
+
+// Returns the standard shared-memory layout used by rpc-bench's hybrid local
+// transport for one fixed worker-slot count.
+[[nodiscard]] ShmTransportOptions default_shm_transport_options(std::size_t slot_count);
 
 class ShmMessageRingView {
   // Non-owning view over one single-producer/single-consumer ring inside the
@@ -164,12 +167,14 @@ private:
 enum class ControlMessageKind : std::uint8_t {
   init = 1,
   wake = 2,
+  attach = 3,
 };
 
 struct ControlMessage {
   // Fixed-size control frame carried over the hybrid wakeup socket. Direction
   // determines whether the slot refers to the request or response ring, so the
-  // frame only needs a slot index and a small message kind.
+  // frame only needs a small message kind plus one 16-bit value. For `attach`,
+  // `slot_index` carries the active slot count for the benchmark run.
   ControlMessageKind kind = ControlMessageKind::wake;
   std::uint8_t reserved = 0;
   std::uint16_t slot_index = 0;
@@ -250,6 +255,7 @@ public:
   [[nodiscard]] virtual std::expected<void, std::string> send(ControlMessageKind kind,
                                                               std::size_t slot_index) = 0;
 
+  [[nodiscard]] std::expected<void, std::string> send_attach(std::size_t slot_count);
   [[nodiscard]] std::expected<void, std::string> send_init(std::size_t slot_index);
   [[nodiscard]] std::expected<void, std::string> send_wake(std::size_t slot_index);
 };
@@ -323,16 +329,21 @@ private:
 class ServerControlDispatcher {
   // Owns the server-side read loop for the hybrid wakeup socket. It stays on
   // the KJ thread, signals same-thread wake listeners for each slot, and also
-  // tracks the per-slot init barrier so server integration can wait until all
-  // slots have announced themselves before exposing the transport to RPC code.
+  // tracks the attach + init handshake so server integration can wait until
+  // the connected benchmark has announced the active slot count before exposing
+  // those slots to RPC code.
 public:
   ServerControlDispatcher(kj::AsyncIoStream& stream, std::span<SameThreadWakeListener*> listeners);
 
   // Runs the control-socket read loop until EOF or an error occurs.
   [[nodiscard]] kj::Promise<void> run();
 
-  // Resolves once one init frame has been observed for every configured slot.
+  // Resolves once the benchmark has announced its active slot count and one
+  // init frame has been observed for every active slot.
   [[nodiscard]] kj::Promise<void> initialized();
+
+  // Returns the active slot count announced by the connected benchmark.
+  [[nodiscard]] std::size_t active_slot_count() const;
 
 private:
   [[nodiscard]] kj::Promise<void> pump_one();
@@ -344,7 +355,9 @@ private:
   std::vector<SameThreadWakeListener*> listeners_;
   std::vector<std::uint8_t> init_seen_;
   std::size_t init_count_ = 0;
+  std::size_t active_slot_count_ = 0;
   bool started_ = false;
+  bool attach_seen_ = false;
   ControlMessage read_buffer_{};
   kj::Own<kj::PromiseFulfiller<void>> init_fulfiller_;
   kj::ForkedPromise<void> init_ready_ = nullptr;

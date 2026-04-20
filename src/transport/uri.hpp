@@ -1,11 +1,10 @@
 #pragma once
 
-// Shared transport-URI, payload-limit, and CLI helpers for the CRC32
-// benchmark. Keeping these rules in one internal header ensures the server and
-// benchmark enforce the same user-visible transport contract.
+// Shared transport-URI and CLI parsing helpers for the benchmark frontends and
+// the transport runtime. This layer owns only connection-mode and URI policy,
+// leaving the service contract itself in `src/protocol/`.
 
 #include <charconv>
-#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -14,10 +13,6 @@
 #include <string_view>
 
 namespace rpcbench {
-
-inline constexpr std::size_t kDefaultMessageSizeMin = 128;
-inline constexpr std::size_t kDefaultMessageSizeMax = 256;
-inline constexpr std::uint32_t kMaxPayloadSizeBytes = 1024U * 1024U;
 
 enum class BenchMode : std::uint8_t {
   connect,
@@ -50,17 +45,6 @@ struct TransportUri {
   [[nodiscard]] bool uses_kj_network() const;
 };
 
-struct MessageSizeRange {
-  // Inclusive lower and upper request-payload bounds in bytes. Zero-length
-  // payloads are allowed when explicitly requested, but the range may never
-  // exceed the service's 1 MiB payload limit.
-  std::size_t min = kDefaultMessageSizeMin;
-  std::size_t max = kDefaultMessageSizeMax;
-
-  // Validates ordering and the hard payload cap.
-  [[nodiscard]] std::expected<void, std::string> validate() const;
-};
-
 template <typename Integer>
 std::expected<Integer, std::string> parse_integer(std::string_view text, std::string_view name) {
   Integer value{};
@@ -91,6 +75,10 @@ std::expected<Integer, std::string> parse_integer(std::string_view text, std::st
 // Resolves a sibling binary next to the current executable path.
 [[nodiscard]] std::filesystem::path sibling_binary_path(const std::filesystem::path& argv0,
                                                         std::string_view binary_name);
+
+// Returns the deterministic control-socket path for one shared-memory
+// transport name.
+[[nodiscard]] std::filesystem::path derived_shm_sidecar_path(std::string_view logical_name);
 
 // Returns the stable CLI/report string for one benchmark mode.
 [[nodiscard]] std::string_view bench_mode_name(BenchMode mode);
